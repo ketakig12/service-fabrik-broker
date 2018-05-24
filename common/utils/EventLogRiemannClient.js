@@ -10,11 +10,12 @@ const CONST = require('../constants');
 class EventLogRiemannClient {
   constructor(options) {
     this.isInitialized = false;
+    this.appShuttingDown = false;
     this.options = options;
     if (options.event_type) {
       pubsub.subscribe(options.event_type, (message, data) => this.handleEvent(message, _.cloneDeep(data)));
     }
-    pubsub.subscribe(CONST.TOPIC.APP_SHUTTING_DOWN, () => this.disconnect());
+    pubsub.subscribe(CONST.TOPIC.APP_SHUTTING_DOWN, () => this.disconnectOnAppShutDown());
     this.initialize(options);
   }
 
@@ -34,11 +35,17 @@ class EventLogRiemannClient {
         if (this.options.show_errors) {
           logger.warn('error occurred with riemann ', err);
         }
-        this.isInitialized = false;
+        if(err && err.code && err.code == "ECONNREFUSED") {
+          this.isInitialized = false;
+          setTimeout(() => this.initialize(), 5000);
+        }
       });
       this.riemannClient.on('disconnect', () => {
         logger.debug('Disconnected from Riemann!');
         this.isInitialized = false;
+        if(!this.appShuttingDown) {
+          this.initialize();
+        }
       });
     } catch (err) {
       if (this.options.show_errors) {
@@ -52,7 +59,6 @@ class EventLogRiemannClient {
 
   handleEvent(message, data) {
     try {
-
       if (data.event && !this.skipBasedOnHttpResponseCodes(_.get(data, 'event.response.status'), _.get(config, 'riemann.http_status_codes_to_be_skipped'))) {
         this.logEvent(data.event, data.options);
         //Added to log additional event with instance id or backup guid suffix to the name to provide more details to email alerts
@@ -97,8 +103,9 @@ class EventLogRiemannClient {
     return _.indexOf(httpResponseCodesToSkip, httpResponseCode) !== -1;
   }
 
-  disconnect() {
+  disconnectOnAppShutDown() {
     logger.info('Disconnecting Riemann');
+    this.appShuttingDown = true;
     if (this.isInitialized) {
       this.isInitialized = false;
       this.riemannClient.disconnect();
@@ -125,18 +132,26 @@ class EventLogRiemannClient {
         }
       })
       .value();
+      
+      if(!this.isInitialized) {
+        setTimeout(() => this.sendEvent(info), 5000);
+      } else {
+        this.sendEvent(info);
+      }
+  }
+
+  sendEvent(info) {
     let attempt = 0;
     let messageSent = false;
     do {
       try {
         if (!this.isInitialized) {
-          this.initialize();
+          throw Error('Riemann client not initialized');
         }
         this.riemannClient.send(this.riemannClient.Event(info));
         logger.debug('logging following to riemann : ', info);
         messageSent = true;
       } catch (err) {
-        this.isInitialized = false;
         if (this.options.show_errors) {
           logger.error('Error occurred while sending event to Riemann ', err);
         }
