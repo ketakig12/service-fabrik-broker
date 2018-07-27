@@ -285,17 +285,20 @@ module.exports = Object.freeze({
 
   PLATFORM: {
     CF: 'cloudfoundry',
-    K8S: 'kubernetes'
+    K8S: 'kubernetes',
+    SM: 'sapcp'
   },
 
   PLATFORM_ALIAS_MAPPINGS: {
     'cf': 'cloudfoundry',
-    'k8s': 'kubernetes'
+    'k8s': 'kubernetes',
+    'sm': 'sapcp'
   },
 
   PLATFORM_MANAGER: {
     'cloudfoundry': 'CfPlatformManager',
-    'kubernetes': 'K8sPlatformManager'
+    'kubernetes': 'K8sPlatformManager',
+    'sapcp': 'SMPlatformManager'
   },
 
   AGENT: {
