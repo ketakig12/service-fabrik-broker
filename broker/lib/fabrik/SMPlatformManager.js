@@ -1,7 +1,6 @@
 'use strict';
 
 const BasePlatformManager = require('./BasePlatformManager');
-const _ = require('lodash');
 
 class SMPlatformManager extends BasePlatformManager {
   constructor(platform) {

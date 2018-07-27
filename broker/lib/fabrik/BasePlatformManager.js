@@ -1,5 +1,7 @@
 'use strict';
 
+const _ = require('lodash');
+
 class BasePlatformManager {
   constructor(platform) {
     this.platform = platform;
