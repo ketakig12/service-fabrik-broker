@@ -580,8 +580,6 @@ defaults: &defaults
         - 'Container Deployment'
         - '128 MB Memory'
         - '100 MB Disk'
-      supported_platform:
-      - cf
     - &blueprint_plan2
       id: '6a252f89-c974-4ef9-a4de-c49f300de39a'
       name: 'v1.0-dev-large'
@@ -614,8 +612,6 @@ defaults: &defaults
         - 'Container Deployment'
         - '256 MB Memory'
         - '200 MB Disk'
-      supported_platform:
-      - cf
     - &blueprint_plan7
       id: '61a8d1f7-6477-4eb7-a85d-57ac067e80c4'
       name: 'v1.0-container-large-deprecated'
@@ -649,8 +645,6 @@ defaults: &defaults
         - 'Container Deployment'
         - '256 MB Memory'
         - '200 MB Disk'
-      supported_platform:
-      - cf
     ###########################
     # DEDICATED SERVICE PLANS #
     ###########################
@@ -814,8 +808,6 @@ defaults: &defaults
         - '1 vCPUs'
         - '2 GB Memory'
         - '2 GB Disk'
-      supported_platform:
-      - cf
   ####################
   # RABBITMQ SERVICE #
   ####################
@@ -840,8 +832,6 @@ defaults: &defaults
       secret: 'service-fabrik-rabbitmq-secret1'
       redirect_uri: <%= redirect_uri %>
     plan_updateable: true
-    supported_platform:
-    - cf
     plans:
     ###########################
     # DEDICATED SERVICE PLANS #
@@ -875,8 +865,7 @@ defaults: &defaults
         - '3 Node Cluster'
         - '1 GB Memory'
         - '10 GB Disk'
-      supported_platform:
-      - cf
+
     ###########################
     # SHARED SERVICE PLANS #
     ###########################
@@ -901,8 +890,7 @@ defaults: &defaults
         bullets:
         - 'Shared Deployment'
         - '1 VirtualHost'
-      supported_platform:
-      - cf
+
 
 development: &development
   <<: *defaults
