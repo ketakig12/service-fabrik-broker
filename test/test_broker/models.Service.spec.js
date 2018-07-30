@@ -1,9 +1,9 @@
 'use strict';
 
 const _ = require('lodash');
-const CONST = require('../../broker/lib/constants');
-const config = require('../../broker/lib/config');
-const Service = require('../../broker/lib/models/Service');
+const CONST = require('../../common/constants');
+const config = require('../../common/config');
+const Service = require('../../common/models/Service');
 
 describe('models', () => {
   describe('Service', () => {
@@ -79,7 +79,8 @@ describe('models', () => {
           requires: [],
           plan_updateable: true,
           dashboard_client: {},
-          plans: []
+          plans: [],
+          application_access_ports: null
         });
       });
     });

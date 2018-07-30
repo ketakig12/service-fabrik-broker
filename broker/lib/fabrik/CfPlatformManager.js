@@ -3,13 +3,13 @@
 const _ = require('lodash');
 const Promise = require('bluebird');
 const BasePlatformManager = require('./BasePlatformManager');
-const utils = require('../utils');
+const utils = require('../../../common/utils');
 const assert = require('assert');
-const errors = require('../errors');
-const cloudController = require('../cf').cloudController;
-const logger = require('../logger');
-const CONST = require('../constants');
-const config = require('../config');
+const errors = require('../../../common/errors');
+const cloudController = require('../../../data-access-layer/cf').cloudController;
+const logger = require('../../../common/logger');
+const CONST = require('../../../common/constants');
+const config = require('../../../common/config');
 const SecurityGroupNotCreated = errors.SecurityGroupNotCreated;
 const SecurityGroupNotFound = errors.SecurityGroupNotFound;
 const ordinals = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth', 'Seventh', 'Eighth', 'Ninth', 'Tenth'];
@@ -115,10 +115,14 @@ class CfPlatformManager extends BasePlatformManager {
   }
 
   buildSecurityGroupRules(options) {
+    let portRule = '1024-65535';
+    if (Array.isArray(options.applicationAccessPorts) && _.size(options.applicationAccessPorts) > 0) {
+      portRule = _.join(options.applicationAccessPorts, ',');
+    }
     return {
       protocol: options.protocol,
       destination: _.size(options.ips) === 1 ? `${_.first(options.ips)}` : `${_.first(options.ips)}-${_.last(options.ips)}`,
-      ports: _.size(options.ports) === 1 ? `${_.first(options.ports)}` : `${_.first(options.ports)}-${_.last(options.ports)}`
+      ports: portRule
     };
   }
 }

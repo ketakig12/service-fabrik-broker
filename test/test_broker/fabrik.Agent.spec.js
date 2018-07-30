@@ -3,7 +3,7 @@
 const _ = require('lodash');
 const Promise = require('bluebird');
 const lib = require('../../broker/lib');
-const FeatureNotSupportedByAnyAgent = lib.errors.FeatureNotSupportedByAnyAgent;
+const FeatureNotSupportedByAnyAgent = require('../../common/errors').FeatureNotSupportedByAnyAgent;
 const Agent = lib.fabrik.Agent;
 
 describe('fabrik', function () {
@@ -24,6 +24,8 @@ describe('fabrik', function () {
     const parameters = {
       foo: 'bar'
     };
+    const preBindResponse = {};
+    const preUnbindResponse = {};
     const credentials = {
       password: 'secret'
     };
@@ -329,15 +331,17 @@ describe('fabrik', function () {
         pathname = 'credentials/create';
         expectedStatus = 200;
         _.set(body, 'parameters', parameters);
+        _.set(body, 'actions', preBindResponse);
       });
 
       after(function () {
         _.unset(body, 'parameters');
+        _.unset(body, 'actions');
       });
 
       it('returns a JSON object', function () {
         return agent
-          .createCredentials(ips, parameters)
+          .createCredentials(ips, parameters, preBindResponse)
           .then(body => {
             expect(body).to.equal(response.body);
             expect(requestStub).to.have.been.calledTwice;
@@ -350,15 +354,17 @@ describe('fabrik', function () {
         pathname = 'credentials/delete';
         expectedStatus = 200;
         _.set(body, 'credentials', credentials);
+        _.set(body, 'actions', preUnbindResponse);
       });
 
       after(function () {
         _.unset(body, 'credentials');
+        _.unset(body, 'actions');
       });
 
       it('returns a JSON object', function () {
         return agent
-          .deleteCredentials(ips, credentials)
+          .deleteCredentials(ips, credentials, preUnbindResponse)
           .then(body => {
             expect(body).to.equal(response.body);
             expect(requestStub).to.have.been.calledTwice;

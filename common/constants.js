@@ -31,6 +31,12 @@ module.exports = Object.freeze({
   },
   EVENTMESH_POLLER_DELAY: 200,
   UNLOCK_RESOURCE_POLLER_INTERVAL: 3000,
+  BACKUP_OPERATION: {
+    SUCCEEDED: 'succeeded',
+    FAILED: 'failed',
+    ABORTED: 'aborted',
+    PROCESSING: 'processing'
+  },
   OPERATION: {
     SUCCEEDED: 'succeeded',
     FAILED: 'failed',
@@ -105,7 +111,6 @@ module.exports = Object.freeze({
     SHUTDOWN_WAIT_TIME: 5000
   },
   BACKUP: {
-    BACKUP_START_TIMEOUT: 15, //SECONDS
     TYPE: {
       ONLINE: 'online'
     },
@@ -227,6 +232,7 @@ module.exports = Object.freeze({
     }
   },
   APISERVER: {
+    OPERATION_TIMEOUT_IN_SECS: 60,
     WATCHER_REFRESH_INTERVAL: 1200000, // in ms ( 20 minutes )
     PORT: 9443,
     VERSION: '1.9',
@@ -249,8 +255,8 @@ module.exports = Object.freeze({
       DELETE: 'delete',
       DELETED: 'deleted',
       SUCCEEDED: 'succeeded',
-      ERROR: 'error',
       FAILED: 'failed',
+      DELETE_FAILED: 'delete_failed',
       ABORTED: 'aborted',
     },
     RESOURCE_KEYS: {
@@ -350,5 +356,8 @@ module.exports = Object.freeze({
       MODIFIED: 'MODIFIED',
       DELETED: 'DELETED'
     }
+  },
+  NETWORK_MANAGER: {
+    NETWORK_ID: 'SF'
   }
 });

@@ -3,15 +3,14 @@
 const _ = require('lodash');
 const errors = require('../../common/errors');
 const logger = require('../../common/logger');
-const quota = require('../lib/quota');
+const quota = require('../../quota');
 const quotaManager = quota.quotaManager;
 const Forbidden = errors.Forbidden;
 const BadRequest = errors.BadRequest;
 const utils = require('../../common/utils');
-const catalog = require('./models/catalog');
-const config = require('./config');
-const lockManager = require('../../eventmesh').lockManager;
-const CONST = require('./constants');
+const catalog = require('../../common/models/catalog');
+const lockManager = require('../../data-access-layer/eventmesh').lockManager;
+const CONST = require('./../../common/constants');
 const DeploymentAlreadyLocked = errors.DeploymentAlreadyLocked;
 const UnprocessableEntity = errors.UnprocessableEntity;
 
@@ -25,16 +24,21 @@ exports.isFeatureEnabled = function (featureName) {
   };
 };
 
-exports.validateRequest = function (operationType) {
+exports.validateRequest = function () {
   return function (req, res, next) {
     /* jshint unused:false */
     if (req.instance.async && (_.get(req, 'query.accepts_incomplete', 'false') !== 'true')) {
-      next(new UnprocessableEntity('This request requires client support for asynchronous service operations.', 'AsyncRequired'));
+      return next(new UnprocessableEntity('This request requires client support for asynchronous service operations.', 'AsyncRequired'));
     }
-    if (_.includes([CONST.OPERATION_TYPE.CREATE], operationType) &&
-      //TODO-PR - Move this to validateCreateRequest and have ValidateRequest for all HTTP Operations and not for each operation type in the route setup code.
-      (!_.get(req.body, 'space_guid') || !_.get(req.body, 'organization_guid'))) {
-      next(new BadRequest('This request is missing mandatory organization guid and/or space guid.'));
+    next();
+  };
+};
+
+exports.validateCreateRequest = function () {
+  return function (req, res, next) {
+    /* jshint unused:false */
+    if (!_.get(req.body, 'space_guid') || !_.get(req.body, 'organization_guid')) {
+      return next(new BadRequest('This request is missing mandatory organization guid and/or space guid.'));
     }
     next();
   };
@@ -42,14 +46,14 @@ exports.validateRequest = function (operationType) {
 
 exports.lock = function (operationType, lastOperationCall) {
   return function (req, res, next) {
-    if (req.manager.name === CONST.INSTANCE_TYPE.DIRECTOR && config.enable_service_fabrik_v2) {
+    if (req.manager.name === CONST.INSTANCE_TYPE.DIRECTOR) {
       // Acquire lock for this instance
       return lockManager.lock(req.params.instance_id, {
           lockedResourceDetails: {
             resourceGroup: CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT,
             resourceType: CONST.APISERVER.RESOURCE_TYPES.DIRECTOR,
             resourceId: req.params.instance_id,
-            operation: operationType ? operationType : req.query.operation.type // This is for the last operation call
+            operation: operationType ? operationType : utils.decodeBase64(req.query.operation).type // This is for the last operation call
           }
         })
         .then(() => next())
@@ -68,16 +72,14 @@ exports.lock = function (operationType, lastOperationCall) {
   };
 };
 
-exports.isWriteLocked = function () {
-  //TODO-PR - can name this method to checkBlockingOperationInProgress or checkWriteLocked -- as this is really not returning a boolean.
+exports.checkBlockingOperationInProgress = function () {
   return function (req, res, next) {
-    if (req.manager.name === CONST.INSTANCE_TYPE.DIRECTOR && config.enable_service_fabrik_v2) {
+    if (req.manager.name === CONST.INSTANCE_TYPE.DIRECTOR) {
       // Acquire lock for this instance
-      return lockManager.isWriteLocked(req.params.instance_id)
-        .then(isWriteLocked => {
-          if (isWriteLocked) {
-            //TODO-PR - Its better to fetchLock here instead of a boolean as you can better construct the error with the operaiton and the time the lock has been acquired.
-            next(new DeploymentAlreadyLocked(req.params.instance_id, undefined, `Resource ${req.params.instance_id} is write locked`));
+      return lockManager.checkWriteLockStatus(req.params.instance_id)
+        .then(writeLockStatus => {
+          if (writeLockStatus.isWriteLocked) {
+            next(new DeploymentAlreadyLocked(req.params.instance_id, undefined, `Resource ${req.params.instance_id} is write locked for ${writeLockStatus.lockDetails.lockedResourceDetails.operation} at ${writeLockStatus.lockDetails.lockTime}`));
           } else {
             next();
           }

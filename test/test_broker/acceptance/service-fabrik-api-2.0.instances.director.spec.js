@@ -4,17 +4,18 @@ const _ = require('lodash');
 const Promise = require('bluebird');
 const moment = require('moment');
 const lib = require('../../../broker/lib');
-const ScheduleManager = require('../../../broker/lib/jobs');
-const CONST = require('../../../broker/lib/constants');
+const ScheduleManager = require('../../../jobs');
+const CONST = require('../../../common/constants');
 const apps = require('../support/apps');
-const catalog = lib.models.catalog;
-const config = lib.config;
-const errors = lib.errors;
+const catalog = require('../../../common/models').catalog;
+const config = require('../../../common/config');
+const errors = require('../../../common/errors');
 const fabrik = lib.fabrik;
-const utils = lib.utils;
+const utils = require('../../../common/utils');
 const NotFound = errors.NotFound;
-const backupStore = lib.iaas.backupStore;
-const filename = lib.iaas.backupStore.filename;
+const iaas = require('../../../data-access-layer/iaas');
+const backupStore = iaas.backupStore;
+const filename = iaas.backupStore.filename;
 
 function enableServiceFabrikV2() {
   config.enable_service_fabrik_v2 = true;
@@ -92,7 +93,7 @@ describe('service-fabrik-api-sf2.0', function () {
       before(function () {
         enableServiceFabrikV2();
         config.mongodb.provision.plan_id = 'bc158c9a-7934-401e-94ab-057082a5073f';
-        backupStore.cloudProvider = new lib.iaas.CloudProviderClient(config.backup.provider);
+        backupStore.cloudProvider = new iaas.CloudProviderClient(config.backup.provider);
         mocks.cloudProvider.auth();
         mocks.cloudProvider.getContainer(container);
         _.unset(fabrik.DirectorManager, plan_id);
@@ -118,7 +119,7 @@ describe('service-fabrik-api-sf2.0', function () {
       after(function () {
         disableServiceFabrikV2();
         timestampStub.restore();
-        backupStore.cloudProvider = lib.iaas.cloudProvider;
+        backupStore.cloudProvider = iaas.cloudProvider;
         cancelScheduleStub.restore();
         scheduleStub.restore();
         getScheduleStub.restore();
@@ -417,6 +418,7 @@ describe('service-fabrik-api-sf2.0', function () {
             }));
         });
 
+        // TODO
         // it.only('should initiate a  backup operation & if a backup is already in progress then it must result in DeploymentAlready locked message', function () {
         //   mocks.uaa.tokenKey();
         //   mocks.cloudController.getServiceInstance(instance_id, {
@@ -481,30 +483,12 @@ describe('service-fabrik-api-sf2.0', function () {
       });
 
       describe('#backup-state', function () {
-        const service_id = '24731fb8-7b84-4f57-914f-c3d55d793dd4';
-        const plan_id = 'bc158c9a-7934-401e-94ab-057082a5073f';
-        const plan_guid = '60750c9c-8937-4caf-9e94-c38cbbbfd191';
-        const instance_id = mocks.director.uuidByIndex(index);
-        const space_guid = 'e7c0a437-7585-4d75-addf-aa4d45b49f3a';
-        const backup_guid = '071acb05-66a3-471b-af3c-8bbf1e4180be';
-        const container = backupStore.containerName;
-        const prefix = `${space_guid}/backup`;
-        const backupFilename = `${prefix}/${service_id}.${instance_id}.${backup_guid}`;
-        const pathname = `/${container}/${backupFilename}`;
         const data = {
-          instance_guid: instance_id,
-          tenant_id: space_guid,
-          service_id: service_id,
-          backup_guid: backup_guid,
           trigger: CONST.BACKUP.TRIGGER.ON_DEMAND,
           state: 'processing',
           agent_ip: mocks.agent.ip
         };
         const backupState = {
-          instance_guid: instance_id,
-          tenant_id: space_guid,
-          service_id: service_id,
-          backup_guid: backup_guid,
           state: 'processing',
           stage: 'Deleting volume',
           updated_at: new Date(Date.now())
@@ -518,8 +502,6 @@ describe('service-fabrik-api-sf2.0', function () {
           });
           mocks.cloudController.findServicePlan(instance_id, plan_id);
           mocks.cloudController.getSpaceDevelopers(space_guid);
-          mocks.cloudProvider.list(container, backupFilename, [backupFilename]);
-          mocks.cloudProvider.download(pathname, data);
 
           mocks.apiServerEventMesh.nockGetResource('deployment', 'director', instance_id, {
             metadata: {
@@ -548,7 +530,7 @@ describe('service-fabrik-api-sf2.0', function () {
               const result = _
                 .chain(data)
                 .omit('agent_ip')
-                .merge(_.pick(backupState, 'state', 'stage', 'backup_guid', 'instance_guid', 'service_id', 'tenant_id'))
+                .merge(_.pick(backupState, 'state', 'stage'))
                 .value();
               expect(res).to.have.status(200);
               expect(res.body).to.eql(result);
@@ -564,8 +546,6 @@ describe('service-fabrik-api-sf2.0', function () {
           });
           mocks.cloudController.findServicePlan(instance_id, plan_id);
           mocks.cloudController.getSpaceDevelopers(space_guid);
-          mocks.cloudProvider.list(container, backupFilename, [backupFilename]);
-          mocks.cloudProvider.download(pathname, data);
           mocks.apiServerEventMesh.nockGetResource('deployment', 'director', instance_id, {
             metadata: {
               labels: {
@@ -597,8 +577,6 @@ describe('service-fabrik-api-sf2.0', function () {
           mocks.uaa.tokenKey();
           mocks.cloudController.findServicePlan(instance_id, plan_id);
           mocks.cloudController.getSpaceDevelopers(space_guid);
-          mocks.cloudProvider.list(container, backupFilename, [backupFilename]);
-          mocks.cloudProvider.download(pathname, data);
           mocks.apiServerEventMesh.nockGetResource('deployment', 'director', instance_id, {
             metadata: {
               labels: {
@@ -633,8 +611,6 @@ describe('service-fabrik-api-sf2.0', function () {
           mocks.uaa.tokenKey();
           mocks.cloudController.findServicePlan(instance_id, plan_id);
           mocks.cloudController.getSpaceDevelopers(space_guid);
-          mocks.cloudProvider.list(container, backupFilename, [backupFilename]);
-          mocks.cloudProvider.download(pathname, data);
           mocks.apiServerEventMesh.nockGetResource('deployment', 'director', instance_id, {
             metadata: {
               labels: {
@@ -666,12 +642,52 @@ describe('service-fabrik-api-sf2.0', function () {
             });
         });
 
-        it('should return 404 Not Found', function () {
+        it('should return 200 Ok - should check blobstore if metadata is not found in apiserver', function () {
           mocks.uaa.tokenKey();
-          mocks.cloudController.getServiceInstance(instance_id, {
-            space_guid: space_guid,
-            service_plan_guid: plan_guid
+          mocks.cloudController.findServicePlan(instance_id, plan_id, 2);
+          mocks.cloudController.getSpaceDevelopers(space_guid);
+          mocks.apiServerEventMesh.nockGetResource('deployment', 'director', instance_id, {
+            metadata: {
+              labels: {
+                last_backup_defaultbackups: backup_guid
+              }
+            }
           });
+          mocks.apiServerEventMesh.nockGetResource('backup', 'defaultbackup', backup_guid, {
+            status: {
+              response: JSON.stringify(data)
+            }
+          }, 1, 404);
+          const backupPrefix = `${space_guid}/backup/${service_id}.${instance_id}`;
+          const backupFilename = `${space_guid}/backup/${service_id}.${instance_id}.${backup_guid}.${started_at}.json`;
+          mocks.cloudProvider.list(container, backupPrefix, [backupFilename]);
+          const pathname = `/${container}/${backupFilename}`;
+          mocks.cloudProvider.download(pathname, data);
+          // mocks.agent.lastBackupOperation(backupState);
+          return chai.request(apps.external)
+            .get(`${base_url}/service_instances/${instance_id}/backup`)
+            .set('Authorization', authHeader)
+            .query({
+              space_guid: space_guid,
+            })
+            .catch(err => err.response)
+            .then(res => {
+              expect(res).to.have.status(200);
+              expect(res.body).to.eql(_.omit(data, 'agent_ip'));
+              mocks.verify();
+            });
+        });
+
+        it('should return 404 if Not Found in blobstore and apiserver', function () {
+          const backupPrefix = `${space_guid}/backup/${service_id}.${instance_id}`;
+          const backupFilename = `${space_guid}/backup/${service_id}.${instance_id}.${backup_guid}.${started_at}.json`;
+          const pathname = `/${container}/${backupFilename}`;
+          mocks.uaa.tokenKey();
+          // mocks.cloudController.getServiceInstance(instance_id, {
+          //   space_guid: space_guid,
+          //   service_plan_guid: plan_guid
+          // });
+          mocks.cloudController.findServicePlan(instance_id, plan_id);
           mocks.cloudController.findServicePlan(instance_id, plan_id);
           mocks.cloudController.getSpaceDevelopers(space_guid);
           mocks.apiServerEventMesh.nockGetResource('deployment', 'director', instance_id, {
@@ -681,9 +697,19 @@ describe('service-fabrik-api-sf2.0', function () {
               }
             }
           });
+          mocks.apiServerEventMesh.nockGetResource('backup', 'defaultbackup', backup_guid, {
+            status: {
+              response: JSON.stringify(data)
+            }
+          }, 1, 404);
+          mocks.cloudProvider.list(container, backupPrefix, [backupFilename]);
+          mocks.cloudProvider.download(pathname, new NotFound('not found'));
           return chai.request(apps.external)
             .get(`${base_url}/service_instances/${instance_id}/backup`)
             .set('Authorization', authHeader)
+            .query({
+              space_guid: space_guid,
+            })
             .catch(err => err.response)
             .then(res => {
               expect(res).to.have.status(404);
@@ -691,6 +717,7 @@ describe('service-fabrik-api-sf2.0', function () {
               mocks.verify();
             });
         });
+
       });
 
       describe('#backup-abort', function () {
@@ -761,6 +788,44 @@ describe('service-fabrik-api-sf2.0', function () {
             }
           }, 2);
           mocks.apiServerEventMesh.nockPatchResourceStatus('backup', 'defaultbackup', {});
+          return chai
+            .request(apps.external)
+            .delete(`${base_url}/service_instances/${instance_id}/backup`)
+            .set('Authorization', authHeader)
+            .catch(err => err.response)
+            .then(res => {
+              expect(res).to.have.status(200);
+              expect(res.body).to.be.empty;
+              mocks.verify();
+            });
+        });
+        it('should return skip abort if state is not "in_progress"', function () {
+          mocks.uaa.tokenKey();
+          mocks.cloudController.getServiceInstance(instance_id, {
+            space_guid: space_guid,
+            service_plan_guid: plan_guid
+          });
+          mocks.cloudController.findServicePlan(instance_id, plan_id);
+          mocks.cloudController.getSpaceDevelopers(space_guid);
+          mocks.apiServerEventMesh.nockGetResource('deployment', 'director', instance_id, {
+            metadata: {
+              labels: {
+                last_backup_defaultbackups: 'b4719e7c-e8d3-4f7f-c515-769ad1c3ebfa'
+              }
+            }
+          });
+          mocks.apiServerEventMesh.nockGetResourceRegex('backup', 'defaultbackup', {
+            status: {
+              state: 'succeeded',
+              response: '{"guid": "some_guid"}'
+            }
+          });
+          mocks.apiServerEventMesh.nockGetResourceRegex('backup', 'defaultbackup', {
+            status: {
+              state: 'aborted',
+              response: '{"guid": "some_guid"}'
+            }
+          }, 2);
           return chai
             .request(apps.external)
             .delete(`${base_url}/service_instances/${instance_id}/backup`)
@@ -1466,8 +1531,8 @@ describe('service-fabrik-api-sf2.0', function () {
               options: JSON.stringify(data)
             },
             status: {
-              state: 'error',
-              response: JSON.stringify(new errors.Forbidden('Delete of scheduled backup not permitted within retention period of 14 days'))
+              state: CONST.APISERVER.RESOURCE_STATE.DELETE_FAILED,
+              error: JSON.stringify(new errors.Forbidden('Delete of scheduled backup not permitted within retention period of 14 days'))
             }
           }, 3);
           mocks.apiServerEventMesh.nockPatchResource('backup', 'defaultbackup', backup_guid, {});

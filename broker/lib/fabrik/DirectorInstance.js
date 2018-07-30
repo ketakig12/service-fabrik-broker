@@ -5,16 +5,16 @@ const Promise = require('bluebird');
 const _ = require('lodash');
 const yaml = require('js-yaml');
 const BaseInstance = require('./BaseInstance');
-const config = require('../config');
-const logger = require('../logger');
-const errors = require('../errors');
+const config = require('../../../common/config');
+const logger = require('../../../common/logger');
+const errors = require('../../../common/errors');
 const jwt = require('../jwt');
-const utils = require('../utils');
-const catalog = require('../models').catalog;
+const utils = require('../../../common/utils');
+const catalog = require('../../../common/models').catalog;
 const NotFound = errors.NotFound;
 const ServiceInstanceNotFound = errors.ServiceInstanceNotFound;
-const ScheduleManager = require('../jobs');
-const CONST = require('../constants');
+const ScheduleManager = require('../../../jobs');
+const CONST = require('../../../common/constants');
 const ordinals = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth', 'Seventh', 'Eighth', 'Ninth', 'Tenth'];
 
 class DirectorInstance extends BaseInstance {
@@ -50,15 +50,7 @@ class DirectorInstance extends BaseInstance {
   }
 
   get async() {
-    if (config.enable_service_fabrik_v2) {
-      return true;
-      //Backup operation is being turned into SYNCH and behind the scenes polling will happen to check status.
-      //Rationale : Bind operations can happen while backups are happening.
-    } else {
-      return this.operation !== CONST.OPERATION_TYPE.BACKUP && this.operation !== CONST.OPERATION_TYPE.UNLOCK;
-      //Backup/Unlock operation is being turned into SYNCH and behind the scenes polling will happen to check status.
-      //Rationale : Bind operations can happen while backups are happening.
-    }
+    return true;
   }
 
   initialize(operation) {
@@ -162,70 +154,6 @@ class DirectorInstance extends BaseInstance {
   }
 
   update(params) {
-    if (config.enable_service_fabrik_v2) {
-      return this.update20(params);
-    }
-    return this.update10(params);
-  }
-  update10(params) {
-    const operation = {
-      type: 'update'
-    };
-    // service fabrik operation token
-    const token = _.get(params.parameters, 'service-fabrik-operation', null);
-    if (token) {
-      _.unset(params.parameters, 'service-fabrik-operation');
-      _.set(params, 'scheduled', true);
-    }
-    return this
-      .initialize(operation)
-      .then(() => token ? jwt.verify(token, config.password) : null)
-      .then(serviceFabrikOperation => {
-        logger.info('SF Operation input:', serviceFabrikOperation);
-        this.operation = _.get(serviceFabrikOperation, 'name', 'update');
-        const deploymentLockPromise = (this.operation === CONST.OPERATION_TYPE.UNLOCK) ?
-          Promise.resolve({}) :
-          Promise.try(() => this.manager.verifyDeploymentLockStatus(this.deploymentName));
-        return deploymentLockPromise.return(serviceFabrikOperation);
-      })
-      .then(serviceFabrikOperation => {
-        // normal update operation
-        if (this.operation === 'update') {
-          const args = _.get(serviceFabrikOperation, 'arguments');
-          return this.manager
-            .createOrUpdateDeployment(this.deploymentName, params, args)
-            .then(op => _
-              .chain(operation)
-              .assign(_.pick(params, 'parameters', 'context'))
-              .set('task_id', op.task_id)
-              .set('cached', op.cached)
-              .value()
-            );
-        }
-        // service fabrik operation
-        const previousValues = params.previous_values;
-        const opts = _
-          .chain(previousValues)
-          .pick('plan_id', 'service_id')
-          .set('context', params.context)
-          .set('instance_guid', this.guid)
-          .set('deployment', this.deploymentName)
-          .assign(_.omit(serviceFabrikOperation, 'name'))
-          .value();
-        return this.manager
-          .invokeServiceFabrikOperation(this.operation, opts)
-          .then(result => _
-            .chain(operation)
-            .assign(result)
-            .set('username', serviceFabrikOperation.username)
-            .set('useremail', serviceFabrikOperation.useremail)
-            .set('context', params.context)
-            .value()
-          );
-      });
-  }
-
-  update20(params) {
     const operation = {
       type: 'update'
     };
@@ -278,31 +206,6 @@ class DirectorInstance extends BaseInstance {
   }
 
   delete(params) {
-    if (config.enable_service_fabrik_v2) {
-      return this.delete20(params);
-    }
-    return this.delete10(params);
-  }
-
-  delete10(params) {
-    const operation = {
-      type: 'delete'
-    };
-    return this
-      .initialize(operation)
-      .then(() => this.manager.verifyDeploymentLockStatus(this.deploymentName))
-      .then(() => this.manager.deleteDeployment(this.deploymentName, params))
-      .then(taskId => _
-        .chain(operation)
-        .set('task_id', taskId)
-        .set('context', {
-          platform: this.platformManager.platform
-        })
-        .value()
-      );
-  }
-
-  delete20(params) {
     const operation = {
       type: 'delete'
     };
@@ -420,12 +323,18 @@ class DirectorInstance extends BaseInstance {
       .then(() => this.manager.deleteBinding(this.deploymentName, params.binding_id));
   }
 
+  getApplicationAccessPortsOfService() {
+    let service = this.manager.service.toJSON();
+    return _.get(service, 'application_access_ports');
+  }
+
   buildIpRules() {
+    let applicationAccessPorts = this.getApplicationAccessPortsOfService();
     return _.map(this.manager.getNetwork(this.networkSegmentIndex), net => {
       return {
         protocol: 'tcp',
         ips: net.static,
-        ports: [1024, 65535]
+        applicationAccessPorts: applicationAccessPorts
       };
     });
   }

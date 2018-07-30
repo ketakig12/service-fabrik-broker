@@ -3,7 +3,7 @@
 const _ = require('lodash');
 const nock = require('nock');
 const lib = require('../../../broker/lib');
-const config = lib.config;
+const config = require('../../../common/config');
 const cloudControllerUrl = config.cf.url;
 const DirectorManager = lib.fabrik.DirectorManager;
 const prefix = 'service-fabrik';
@@ -249,7 +249,7 @@ function getServicePlan(plan_guid, plan_unique_id, entity) {
     });
 }
 
-function findServicePlan(instance_id, plan_unique_id) {
+function findServicePlan(instance_id, plan_unique_id, times) {
   const entity = plan_unique_id ? {
     entity: {
       unique_id: plan_unique_id
@@ -257,6 +257,7 @@ function findServicePlan(instance_id, plan_unique_id) {
   } : '';
   return nock(cloudControllerUrl)
     .get(`/v2/service_plans`)
+    .times(times || 1)
     .query({
       q: `service_instance_guid:${instance_id}`
     })
