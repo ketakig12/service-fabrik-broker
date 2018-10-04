@@ -10,6 +10,7 @@ const errors = require('../common/errors');
 const utils = require('../common/utils');
 const retry = utils.retry;
 const ServiceInstanceNotFound = errors.ServiceInstanceNotFound;
+const catalog = require('../common/models').catalog;
 const cloudController = require('../data-access-layer/cf').cloudController;
 const backupStore = require('../data-access-layer/iaas').backupStore;
 const ScheduleManager = require('./ScheduleManager');
@@ -42,26 +43,30 @@ class ScheduleBackupJob extends BaseJob {
           .tap(deleteStatus => instanceDeleted = deleteStatus)
           .then(() => {
             if (instanceDeleted) {
+              if (!_.get(job.attrs.data, 'instance_deletion_time')) {
+                job.attrs.data.instance_deletion_time = new Date(Date.now()).toISOString();
+              }
               return 'instance_deleted';
             }
             return this
               .getFabrikClient()
-              .startBackup(_.pick(jobData, 'instance_id', 'type', 'trigger'))
-              .catch(errors.Conflict, errors.UnprocessableEntity, (err) => {
-                logger.error('Some other operation already in progress on this instance:', err);
-                return retry(() => this.reScheduleBackup(job.attrs.data), {
-                  maxAttempts: 3,
-                  minDelay: 500
-                }).then(() => {
-                  throw err;
-                });
-              });
+              .startBackup(_.pick(jobData, 'instance_id', 'type', 'trigger'));
           })
           .tap(backupResponse => backupRunStatus.start_backup_status = backupResponse)
           .then(() => this.deleteOldBackup(job, instanceDeleted))
           .tap(deleteResponse => backupRunStatus.delete_backup_status = deleteResponse)
           .then(() => this.runSucceeded(backupRunStatus, job, done))
-          .catch((error) => this.runFailed(error, backupRunStatus, job, done));
+          .catch((error) => {
+            return this.runFailed(error, backupRunStatus, job, done)
+              .then(() => {
+                if (error instanceof errors.Conflict || error instanceof errors.UnprocessableEntity) {
+                  return retry(() => this.reScheduleBackup(job.attrs.data, job.attrs.repeatInterval), {
+                    maxAttempts: 3,
+                    minDelay: 500
+                  });
+                }
+              });
+          });
       })
       .catch(error => {
         logger.error(`Error occurred while handling failure for job :${job.attrs.data[CONST.JOB_NAME_ATTRIB]}`, error);
@@ -79,10 +84,53 @@ class ScheduleBackupJob extends BaseJob {
   }
 
   static deleteOldBackup(job, instanceDeleted) {
+    let transactionLogsBefore;
+
+    function filterOldBackups(oldBackups) {
+      let filteredOldBackups = [];
+      /* oldBackups : This aray should contain all older backups
+      // including last retenion day's backup. E.g. if retention period
+      // is 15 days it would include all backups in (15th, 16th, 17th ...) */
+      if (typeof oldBackups !== 'undefined' && oldBackups.length > 0) {
+        // Older backups are sorted as latest at first
+        let sortedBackups = _.sortBy(oldBackups, ['started_at']).reverse();
+        let deleteAllOlderBackups = false;
+        const latestSuccessIndex = _.findIndex(sortedBackups,
+          backup => backup.state === CONST.OPERATION.SUCCEEDED);
+        if (_.get(job.attrs.data, 'instance_deletion_time')) {
+          const instanceDeletionTime = job.attrs.data.instance_deletion_time;
+          const instanceDeletedBefore = (new Date(Date.now()) - new Date(instanceDeletionTime)) / (24 * 60 * 60 * 1000); //in days
+          if (instanceDeletedBefore > config.backup.retention_period_in_days) {
+            deleteAllOlderBackups = true;
+          }
+        }
+        if (latestSuccessIndex === -1 || deleteAllOlderBackups) {
+          //No successful backup beyond retention period.
+          filteredOldBackups = sortedBackups;
+          transactionLogsBefore = new Date(Date.now() - (config.backup.retention_period_in_days + 1) * 24 * 60 * 60 * 1000).toISOString();
+        } else {
+          //Should return backups before a successful backup.
+          filteredOldBackups = _.slice(sortedBackups, latestSuccessIndex + 1);
+          let backupStartedMillis = new Date(_.get(sortedBackups[latestSuccessIndex], 'started_at')).getTime();
+          transactionLogsBefore = new Date(backupStartedMillis - config.backup.transaction_logs_delete_buffer_time * 60 * 1000).toISOString();
+        }
+      } else {
+        transactionLogsBefore = new Date(Date.now() - (config.backup.retention_period_in_days + 1) * 24 * 60 * 60 * 1000).toISOString();
+      }
+      return filteredOldBackups;
+    }
+
     const options = _.omit(job.attrs.data, 'trigger', 'type');
+    const serviceName = catalog.getService(job.attrs.data.service_id).name;
+    const listOptions = {
+      instance_id: job.attrs.data.instance_id,
+      service_name: serviceName
+    };
     return backupStore
       .listBackupsOlderThan(options, config.backup.retention_period_in_days)
+      .then(oldBackups => filterOldBackups(oldBackups))
       .map(backup => {
+        //Deleting base backup/backup guids.
         logger.debug(`Backup meta info : ${JSON.stringify(backup)}`);
         if (backup.trigger === CONST.BACKUP.TRIGGER.SCHEDULED || instanceDeleted) {
           //on-demand backups must be deleted after instance deletion.
@@ -97,11 +145,24 @@ class ScheduleBackupJob extends BaseJob {
             .deleteBackup(deleteOptions)
             .then(() => backup.backup_guid);
         }
-      }).then(deletedBackupGuids => {
-        logger.info(`Successfully deleted backup guids : ${deletedBackupGuids} - instance deleted : ${instanceDeleted}`);
+      })
+      .then(deletedBackupGuids => {
+        // Deleting transaction logs from service-container.
+        return backupStore.deleteTransactionLogsOlderThan(listOptions, transactionLogsBefore)
+          .then(deletedTransactionLogFilesCount => {
+            const deletedObjects = {
+              deletedBackupGuids: deletedBackupGuids,
+              deletedTransactionLogFilesCount: deletedTransactionLogFilesCount
+            };
+            return deletedObjects;
+          });
+      })
+      .then(deletedObjects => {
+        logger.info(`Successfully deleted backup guids : ${deletedObjects.deletedBackupGuids} - instance deleted : ${instanceDeleted}`);
         const deleteResponse = {
-          deleted_guids: deletedBackupGuids,
+          deleted_guids: deletedObjects.deletedBackupGuids,
           job_cancelled: false,
+          deleted_transaction_log_files_count: deletedObjects.deletedTransactionLogFilesCount,
           instance_deleted: instanceDeleted
         };
         if (!instanceDeleted) {
@@ -109,10 +170,13 @@ class ScheduleBackupJob extends BaseJob {
         }
         logger.info(`Instance deleted. Checking if there are any more backups for :${options.instance_id}`);
         const backupStartedBefore = new Date().toISOString();
-        return backupStore
-          .listBackupFilenames(backupStartedBefore, options)
-          .then(listOfFiles => {
-            if (listOfFiles.length === 0) {
+        transactionLogsBefore = new Date().toISOString();
+        return Promise.all([
+            backupStore.listBackupFilenames(backupStartedBefore, options),
+            backupStore.listTransactionLogsOlderThan(listOptions, transactionLogsBefore)
+          ])
+          .spread((listOfBackups, listOfTransactionLogs) => {
+            if (listOfBackups.length === 0 && listOfTransactionLogs.length === 0) {
               //Instance is deleted and no more backups present. Cancel the backup scheduler for the instance
               logger.info(`-> No more backups for the deleted instance : ${options.instance_id}. Cancelling backup scheduled Job`);
               return ScheduleManager
@@ -128,31 +192,47 @@ class ScheduleBackupJob extends BaseJob {
                 });
 
             } else {
-              logger.info(`Schedule Job for instance  ${options.instance_id} cannot be cancelled yet as ${listOfFiles.length} backup(s) exist`);
+              logger.info(`Schedule Job for instance  ${options.instance_id} cannot be cancelled yet as ${listOfBackups.length} backup(s) exist`);
               return deleteResponse;
             }
           });
       });
   }
 
-  static reScheduleBackup(jobOptions) {
+
+  static reScheduleBackup(jobOptions, repeatInterval) {
     return Promise.try(() => {
       const jobData = _.cloneDeep(jobOptions);
       jobData.attempt = jobData.attempt + 1;
       const MAX_ATTEMPTS = _.get(jobData, 'max_attempts', config.scheduler.jobs.scheduled_backup.max_attempts);
       if (jobData.attempt > MAX_ATTEMPTS) {
         logger.error(`Scheduled backup for instance  ${jobData.instance_id} has exceeded max configured attempts : ${MAX_ATTEMPTS} - ${jobData.attempt}}. Initial attempt was done @: ${jobData.firstAttemptAt}.`);
-        throw new errors.toManyAttempts(config.scheduler.jobs.scheduled_backup.max_attempts, new Error(`Failed to reschedule backup for ${jobData.instance_id}`));
+        // Resetting the number of attempts to 0 and re-creating the schedule with this modified param
+        jobData.attempt = 0;
+        return ScheduleManager.schedule(
+            jobData.instance_id,
+            CONST.JOB.SCHEDULED_BACKUP,
+            repeatInterval,
+            jobData,
+            CONST.SYSTEM_USER)
+          .then(() => {
+            throw new errors.toManyAttempts(config.scheduler.jobs.scheduled_backup.max_attempts, new Error(`Failed to reschedule backup for ${jobData.instance_id}`));
+          });
       }
       const RUN_AFTER = _.get(jobData, 'reschedule_delay', config.scheduler.jobs.reschedule_delay);
+      let retryDelayInMinutes;
       logger.info(`Re-Schedulding Backup Job for ${jobData.instance_id} @ ${RUN_AFTER} - Attempt - ${jobData.attempt}. Initial attempt was done @: ${jobData.firstAttemptAt}`);
-      return ScheduleManager
-        .runAt(jobData.instance_id,
-          CONST.JOB.SCHEDULED_BACKUP,
-          RUN_AFTER,
-          jobData,
-          CONST.SYSTEM_USER
-        );
+      if ((RUN_AFTER.toLowerCase()).indexOf('minutes') !== -1) {
+        retryDelayInMinutes = parseInt(/^[0-9]+/.exec(RUN_AFTER)[0]);
+      }
+      const plan = catalog.getPlan(jobData.plan_id);
+      let retryInterval = utils.getCronWithIntervalAndAfterXminute(plan.service.backup_interval || 'daily', retryDelayInMinutes);
+      return ScheduleManager.schedule(
+        jobData.instance_id,
+        CONST.JOB.SCHEDULED_BACKUP,
+        retryInterval,
+        jobData,
+        CONST.SYSTEM_USER);
     });
   }
 }

@@ -3,6 +3,13 @@
 module.exports = Object.freeze({
   NETWORK_SEGMENT_LENGTH: 4,
   BOSH_POLL_MAX_ATTEMPTS: 3,
+  BOSH_DEPLOYMENT_ACTIONS: {
+    STOPPED: 'stopped',
+    STARTED: 'started',
+    DETACHED: 'detached',
+    RESTART: 'restart',
+    RECREATE: 'recreate'
+  },
   BOSH_RATE_LIMITS: {
     BOSH_CONTEXT_ID: 'X-Bosh-Context-Id',
     BOSH_FABRIK_OP: 'Fabrik::Operation::',
@@ -20,6 +27,7 @@ module.exports = Object.freeze({
   PLATFORM_CONTEXT_KEY: 'platform-context',
   NOT_APPLICABLE: 'NA',
   FINISHED_JOBS_RETENTION_DURATION_DAYS: 14,
+  BACKUP_REAPER_BUFFER_DURATION_DAYS: 15,
   EVENT_LOG_RIEMANN_CLIENT: {
     MAX_QUEUE_SIZE: 100,
     MAX_SEND_RETRIES: 2
@@ -31,12 +39,23 @@ module.exports = Object.freeze({
   },
   EVENTMESH_POLLER_DELAY: 200,
   UNLOCK_RESOURCE_POLLER_INTERVAL: 3000,
+  RESTORE_RESOURCE_POLLER_INTERVAL: 3000,
+  RESTORE_OPERATION: {
+    SUCCEEDED: 'succeeded',
+    FAILED: 'failed',
+    ABORTED: 'aborted',
+    PROCESSING: 'processing'
+  },
   BACKUP_OPERATION: {
     SUCCEEDED: 'succeeded',
     FAILED: 'failed',
     ABORTED: 'aborted',
     PROCESSING: 'processing'
   },
+  DIRECTOR_RESOURCE_POLLER_INTERVAL: 50000, // in ms
+  DIRECTOR_RESOURCE_POLLER_RELAXATION_TIME: 5000, // in ms
+  BACKUP_RESOURCE_POLLER_RELAXATION_TIME: 5000, //in ms
+  PROCESSING_REQUEST_BY_MANAGER_TIMEOUT: 300000, // 5 minutes
   OPERATION: {
     SUCCEEDED: 'succeeded',
     FAILED: 'failed',
@@ -47,6 +66,7 @@ module.exports = Object.freeze({
   },
   SF_BROKER_API_VERSION_MIN: '2.12',
   OPERATION_TYPE: {
+    LIFECYCLE: ['create', 'update', 'delete'],
     BACKUP: 'backup',
     RESTORE: 'restore',
     UNLOCK: 'unlock',
@@ -97,7 +117,6 @@ module.exports = Object.freeze({
     SERVICE_FABRIK_BACKUP: 'ServiceFabrikBackup',
     SCHEDULED_OOB_DEPLOYMENT_BACKUP: 'ScheduledOobDeploymentBackup',
     OPERATION_STATUS_POLLER: 'OperationStatusPoller',
-    BNR_STATUS_POLLER: 'BnRStatusPoller',
     BLUEPRINT_JOB: 'BluePrintJob',
     BACKUP_REAPER: 'BackupReaper',
     SERVICE_INSTANCE_UPDATE: 'ServiceInstanceAutoUpdate',
@@ -111,6 +130,7 @@ module.exports = Object.freeze({
     SHUTDOWN_WAIT_TIME: 5000
   },
   BACKUP: {
+    RESCHEDULE_BACKUP_DELAY_AFTER_RESTORE: 3,
     TYPE: {
       ONLINE: 'online'
     },
@@ -122,7 +142,7 @@ module.exports = Object.freeze({
   },
   SCHEDULE: {
     DAILY: 'daily',
-    RANDOM: 'random',
+    RANDOM: 'random'
   },
   SCHEDULE_INTERVAL: {
     HUMAN_INTERVAL: 'human-readable-interval',
@@ -198,6 +218,7 @@ module.exports = Object.freeze({
     CONTENT_TYPE: 'application/x-www-form-urlencoded',
     ACCEPT: 'application/json'
   },
+  SERVICE_BROKER_ERR_MSG: 'Service Broker Error: Something unexpected happened',
   ERR_CODES: {
     UNKNOWN: 'ERR-CODE-UNKNOWN',
     PRE_CONDITION_NOT_MET: 'PRE_CONDITION_NOT_MET',
@@ -232,22 +253,40 @@ module.exports = Object.freeze({
     }
   },
   APISERVER: {
-    OPERATION_TIMEOUT_IN_SECS: 60,
-    WATCHER_REFRESH_INTERVAL: 1200000, // in ms ( 20 minutes )
-    PORT: 9443,
+    OPERATION_TIMEOUT_IN_SECS: 175,
+    RETRY_DELAY: 2000,
+    MAX_RETRY_UNLOCK: 3,
+    LOCK_TYPE: {
+      WRITE: 'WRITE',
+      READ: 'READ'
+    },
+    DEFAULT_LOCK_TTL: 86400, // 1 days in sec
+    WATCHER_ERROR_DELAY: 30000, // in ms (30 seconds)
+    WATCHER_REFRESH_INTERVAL: 60000, // in ms ( 1 minute )
+    POLLER_WATCHER_REFRESH_INTERVAL: 120000, // // in ms should be greater than DIRECTOR_RESOURCE_POLLER_INTERVAL
+    WATCH_TIMEOUT: 600, // in sec (10 minutes)
     VERSION: '1.9',
-    HOSTNAME: 'servicefabrik.io',
     NAMESPACE: 'default',
     API_VERSION: 'v1alpha1',
+    CRD_RESOURCE_GROUP: 'apiextensions.k8s.io',
+    PATCH_CONTENT_TYPE: 'application/merge-patch+json',
     RESOURCE_GROUPS: {
-      LOCK: 'lock',
-      DEPLOYMENT: 'deployment',
-      BACKUP: 'backup'
+      LOCK: 'lock.servicefabrik.io',
+      DEPLOYMENT: 'deployment.servicefabrik.io',
+      BIND: 'bind.servicefabrik.io',
+      BACKUP: 'backup.servicefabrik.io',
+      RESTORE: 'backup.servicefabrik.io'
     },
     RESOURCE_TYPES: {
       DEPLOYMENT_LOCKS: 'deploymentlocks',
       DIRECTOR: 'directors',
-      DEFAULT_BACKUP: 'defaultbackups'
+      DOCKER: 'dockers',
+      VIRTUALHOST: 'virtualhosts',
+      DIRECTOR_BIND: 'directorbinds',
+      DOCKER_BIND: 'dockerbinds',
+      VIRTUALHOST_BIND: 'virtualhostbinds',
+      DEFAULT_BACKUP: 'defaultbackups',
+      DEFAULT_RESTORE: 'defaultrestores'
     },
     RESOURCE_STATE: {
       IN_QUEUE: 'in_queue',
@@ -257,23 +296,17 @@ module.exports = Object.freeze({
       SUCCEEDED: 'succeeded',
       FAILED: 'failed',
       DELETE_FAILED: 'delete_failed',
+      ABORT: 'abort',
+      ABORTING: 'aborting',
       ABORTED: 'aborted',
+      UPDATE: 'update',
+      LOCKED: 'locked',
+      UNLOCKED: 'unlocked'
     },
     RESOURCE_KEYS: {
       STATE: 'state',
       OPTIONS: 'options',
       LASTOPERATION: 'lastoperation'
-    },
-    ANNOTATION_KEYS: {
-      STATE: 'state',
-      OPTIONS: 'options',
-      RESULT: 'result'
-    },
-    ANNOTATION_NAMES: {
-      BACKUP: 'backup'
-    },
-    ANNOTATION_TYPES: {
-      BACKUP: 'defaultbackups'
     },
     WRITE_OPERATIONS: ['create', 'update', 'delete', 'restore'],
     READ_OPERATIONS: ['backup'],
@@ -282,7 +315,11 @@ module.exports = Object.freeze({
     ATTRIBUTES: 'attributes',
     PLANS: 'plans'
   },
-
+  ENCRYPTION: {
+    AES_256_ALGORITHM: 'aes-256-ctr',
+    INPUT_ENCODING: 'utf8',
+    OUTPUT_ENCODING: 'hex'
+  },
   PLATFORM: {
     CF: 'cloudfoundry',
     K8S: 'kubernetes',
@@ -308,7 +345,8 @@ module.exports = Object.freeze({
       BACKUP: 'backup',
       RESTORE: 'restore',
       MULTI_TENANCY: 'multi_tenancy'
-    }
+    },
+    OPERATION_TIMEOUT_IN_MILLIS: 35000
   },
   STATE: {
     ACTIVE: 'active',
@@ -340,12 +378,6 @@ module.exports = Object.freeze({
     JSON: 'json',
     NUMBER: 'number',
     STRING: 'string',
-    RETRY_DELAY: 2000,
-    MAX_RETRY_UNLOCK: 3,
-    LOCK_TYPE: {
-      WRITE: 'WRITE',
-      READ: 'READ'
-    },
     LOCK_TTL: 5,
     LOCK_KEY_SUFFIX: '/lock',
     LOCK_DETAILS_SUFFIX: '/lock/details'

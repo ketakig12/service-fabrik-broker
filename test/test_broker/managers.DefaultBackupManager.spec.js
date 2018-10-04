@@ -7,6 +7,7 @@ const config = require('../../common/config');
 const CONST = require('../../common/constants');
 const catalog = require('../../common/models/catalog');
 const eventmesh = require('../../data-access-layer/eventmesh/ApiServerClient');
+const apiserver = new eventmesh();
 
 const backup_guid = '071acb05-66a3-471b-af3c-8bbf1e4180bc';
 const plan_id = 'bc158c9a-7934-401e-94ab-057082a5073f';
@@ -25,7 +26,7 @@ const resultOptions = {
 const DefaultBackupManager = proxyquire('../../managers/backup-manager/DefaultBackupManager', {
   '../../data-access-layer/eventmesh': {
     'apiServerClient': {
-      'getOperationOptions': function (opts) {
+      'getOptions': function (opts) {
         DefaultBackupManagerDummy.getOperationOptionsDummy(opts);
         return Promise.resolve(resultOptions);
       }
@@ -52,42 +53,54 @@ const DefaultBackupManager = proxyquire('../../managers/backup-manager/DefaultBa
   }
 });
 
+const jsonWriteDelay = 50;
+
 function initDefaultBMTest(jsonStream, sandbox, registerWatcherStub) {
-  const registerWatcherFake = function (resourceGroup, resourceType, callback) {
-    return Promise.try(() => {
-      jsonStream.on('data', callback);
-      return jsonStream;
-    });
-  };
-  registerWatcherStub = sandbox.stub(eventmesh.prototype, 'registerWatcher', registerWatcherFake);
   /* jshint unused:false */
   const bm = new DefaultBackupManager();
   bm.init();
-  expect(registerWatcherStub.callCount).to.equal(1);
-  expect(registerWatcherStub.firstCall.args[0]).to.eql(CONST.APISERVER.RESOURCE_GROUPS.BACKUP);
-  expect(registerWatcherStub.firstCall.args[1]).to.eql(CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
-  expect(registerWatcherStub.firstCall.args[2].name).to.eql('bound handleResource');
-  expect(registerWatcherStub.firstCall.args[3]).to.eql('state in (in_queue,abort,delete)');
-  registerWatcherStub.restore();
+  return Promise.delay(100)
+    .then(() => {
+      expect(registerWatcherStub.callCount).to.equal(1);
+      expect(registerWatcherStub.firstCall.args[0]).to.eql(CONST.APISERVER.RESOURCE_GROUPS.BACKUP);
+      expect(registerWatcherStub.firstCall.args[1]).to.eql(CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      expect(registerWatcherStub.firstCall.args[2].name).to.eql('bound handleResource');
+      expect(registerWatcherStub.firstCall.args[3]).to.eql('state in (in_queue,abort,delete)');
+      registerWatcherStub.restore();
+    });
 }
 
 describe('managers', function () {
   describe('DefaultBackupManager', function () {
     let createServiceSpy, startBackupSpy, abortBackupSpy, deleteBackupSpy, getOperationOptionsSpy, registerWatcherStub, sandbox;
-    before(function () {
+    let jsonStream;
+    let registerWatcherFake;
+    beforeEach(function () {
       sandbox = sinon.sandbox.create();
       createServiceSpy = sinon.spy(DefaultBackupManagerDummy, 'createServiceDummy');
       startBackupSpy = sinon.spy(DefaultBackupManagerDummy, 'startBackupDummy');
       abortBackupSpy = sinon.spy(DefaultBackupManagerDummy, 'abortBackupDummy');
       deleteBackupSpy = sinon.spy(DefaultBackupManagerDummy, 'deleteBackupDummy');
       getOperationOptionsSpy = sinon.spy(DefaultBackupManagerDummy, 'getOperationOptionsDummy');
+      jsonStream = new JSONStream();
+      registerWatcherFake = function (resourceGroup, resourceType, callback) {
+        return Promise.try(() => {
+          jsonStream.on('data', callback);
+          return jsonStream;
+        });
+      };
+      registerWatcherStub = sandbox.stub(eventmesh.prototype, 'registerWatcher', registerWatcherFake);
+      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
     });
 
     afterEach(function () {
-      createServiceSpy.reset();
-      startBackupSpy.reset();
-      abortBackupSpy.reset();
-      deleteBackupSpy.reset();
+      sandbox.restore();
+      createServiceSpy.restore();
+      startBackupSpy.restore();
+      abortBackupSpy.restore();
+      deleteBackupSpy.restore();
+      getOperationOptionsSpy.restore();
+      registerWatcherStub.restore();
     });
 
     it('Should process startBackup request successfully', () => {
@@ -109,15 +122,17 @@ describe('managers', function () {
           }
         }
       };
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         metadata: {
           annotations: config.broker_ip
         }
       }, 2);
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.firstCall.args[0]).to.eql(catalog.getPlan(plan_id));
           expect(startBackupSpy.callCount).to.equal(1);
           expect(startBackupSpy.firstCall.args[0]).to.eql(options);
@@ -144,15 +159,17 @@ describe('managers', function () {
           }
         }
       };
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         metadata: {
           annotations: config.broker_ip
         }
       }, 2);
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.callCount).to.equal(1);
           expect(createServiceSpy.firstCall.args[0]).to.eql(catalog.getPlan(plan_id));
           expect(abortBackupSpy.callCount).to.equal(1);
@@ -180,15 +197,17 @@ describe('managers', function () {
           }
         }
       };
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         metadata: {
           annotations: config.broker_ip
         }
       }, 2);
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.callCount).to.equal(1);
           expect(createServiceSpy.firstCall.args[0]).to.eql(catalog.getPlan(plan_id));
           expect(deleteBackupSpy.callCount).to.equal(1);
@@ -219,10 +238,12 @@ describe('managers', function () {
           }
         }
       };
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.callCount).to.equal(0);
           expect(startBackupSpy.callCount).to.equal(0);
           mocks.verify();
@@ -248,15 +269,17 @@ describe('managers', function () {
           }
         }
       };
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         metadata: {
           annotations: ''
         }
       }, 1, undefined, 409);
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.callCount).to.equal(0);
           expect(startBackupSpy.callCount).to.equal(0);
           mocks.verify();
@@ -282,15 +305,17 @@ describe('managers', function () {
           }
         }
       };
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         metadata: {
           annotations: ''
         }
       }, 1, undefined, 404);
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.callCount).to.equal(0);
           expect(startBackupSpy.callCount).to.equal(0);
           mocks.verify();
@@ -319,10 +344,12 @@ describe('managers', function () {
           }
         }
       };
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.callCount).to.equal(0);
           expect(startBackupSpy.callCount).to.equal(0);
           mocks.verify();
@@ -348,20 +375,22 @@ describe('managers', function () {
           }
         }
       };
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         metadata: {
           annotations: config.broker_ip
         }
       });
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         metadata: {
           annotations: config.broker_ip
         }
       }, 1, undefined, 404);
-      const jsonStream = new JSONStream();
-      initDefaultBMTest(jsonStream, sandbox, registerWatcherStub);
+      const crdJsonDeployment = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT, CONST.APISERVER.RESOURCE_TYPES.DIRECTOR);
+      const crdJsonBackup = apiserver.getCrdJson(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonDeployment.metadata.name, {}, crdJsonDeployment);
+      mocks.apiServerEventMesh.nockPatchCrd(CONST.APISERVER.CRD_RESOURCE_GROUP, crdJsonBackup.metadata.name, {}, crdJsonBackup);
       return Promise.try(() => jsonStream.write(JSON.stringify(changeObject)))
-        .delay(500).then(() => {
+        .delay(jsonWriteDelay).then(() => {
           expect(createServiceSpy.firstCall.args[0]).to.eql(catalog.getPlan(plan_id));
           expect(startBackupSpy.callCount).to.equal(1);
           expect(startBackupSpy.firstCall.args[0]).to.eql(options);

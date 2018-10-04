@@ -31,14 +31,13 @@ router.use(commonMiddleware.error({
 
 /* Service Instance Router */
 instanceRouter.use(controller.handler('ensurePlatformContext'));
-instanceRouter.use(controller.handler('assignInstance'));
 instanceRouter.route('/')
   .put([middleware.isPlanDeprecated(), middleware.checkQuota(), middleware.validateRequest(), middleware.validateCreateRequest(), controller.handleWithResourceLocking('putInstance', CONST.OPERATION_TYPE.CREATE)])
   .patch([middleware.checkQuota(), middleware.validateRequest(), controller.handleWithResourceLocking('patchInstance', CONST.OPERATION_TYPE.UPDATE)])
   .delete([middleware.validateRequest(), controller.handleWithResourceLocking('deleteInstance', CONST.OPERATION_TYPE.DELETE)])
   .all(commonMiddleware.methodNotAllowed(['PUT', 'PATCH', 'DELETE']));
 instanceRouter.route('/last_operation')
-  .get([middleware.lock(undefined, true), controller.handler('getLastInstanceOperation')]) //passing undefined as last operation operationType is part of the req
+  .get(controller.handler('getLastInstanceOperation'))
   .all(commonMiddleware.methodNotAllowed(['GET']));
 instanceRouter.route('/service_bindings/:binding_id')
   .put([middleware.checkBlockingOperationInProgress(), controller.handler('putBinding')])

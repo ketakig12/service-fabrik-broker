@@ -5,7 +5,7 @@ const assert = require('assert');
 const Promise = require('bluebird');
 const BaseController = require('../common/controllers/BaseController');
 const config = require('../common/config');
-const utils = require('../common/utils');
+const logger = require('../common/logger');
 const errors = require('../common/errors');
 const cf = require('../data-access-layer/cf');
 const bosh = require('../data-access-layer/bosh');
@@ -14,6 +14,7 @@ const backupStore = require('../data-access-layer/iaas').backupStore;
 const catalog = require('../common/models/catalog');
 const ContinueWithNext = errors.ContinueWithNext;
 const BadRequest = errors.BadRequest;
+const NotFound = errors.NotFound;
 const CONST = require('../common/constants');
 const lockManager = require('../data-access-layer/eventmesh').lockManager;
 
@@ -35,51 +36,57 @@ class FabrikBaseController extends BaseController {
     return (req, res, next) => {
       let resourceLocked = false;
       let processedRequest = false;
+      let lockId;
       return this._lockResource(req, operationType)
         .tap(() => resourceLocked = true)
-        .then(() => {
+        .then(lockResourceId => {
+          lockId = lockResourceId;
           const fn = _.isString(func) ? this[func] : func;
           return fn.call(this, req, res);
         })
         .tap(() => processedRequest = true)
-        .then(() => this._unlockIfReqfailed(operationType, processedRequest, req, res, next))
-        .catch(err => resourceLocked ? this._unlockIfReqfailed(operationType, processedRequest, req, res, next, err) : next(err));
+        .then(() => this._unlockIfReqfailed(operationType, processedRequest, lockId, req, res, next))
+        .catch(err => resourceLocked ? this._unlockIfReqfailed(operationType, processedRequest, lockId, req, res, next, err) : next(err));
     };
   }
 
   _lockResource(req, operationType) {
+    const plan_id = req.body.plan_id || req.query.plan_id;
+    const plan = catalog.getPlan(plan_id);
     return Promise.try(() => {
-      if (req.manager.name === CONST.INSTANCE_TYPE.DIRECTOR) {
+      if (plan.manager.name === CONST.INSTANCE_TYPE.DIRECTOR) {
         // Acquire lock for this instance
         return lockManager.lock(req.params.instance_id, {
           lockedResourceDetails: {
             resourceGroup: CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT,
             resourceType: CONST.APISERVER.RESOURCE_TYPES.DIRECTOR,
             resourceId: req.params.instance_id,
-            operation: operationType ? operationType : req.query.operation.type // This is for the last operation call
+            operation: operationType
           }
-        });
+        }, plan);
       }
     });
   }
 
-  _unlockIfReqfailed(operationType, processedRequest, req, res, next, err) {
+  _unlockIfReqfailed(operationType, processedRequest, lockId, req, res, next, err) {
+    const plan_id = req.body.plan_id || req.query.plan_id;
+    const plan = catalog.getPlan(plan_id);
     // If processed request
     return Promise
       .try(() => {
         _.set(req, 'params_copy', req.params);
-        if (req.manager.name === CONST.INSTANCE_TYPE.DIRECTOR) {
+        if (plan.manager.name === CONST.INSTANCE_TYPE.DIRECTOR) {
           if (processedRequest) {
             // if sf20 is enabled Check res status and unlock based on the request and status        
             if (
               operationType === CONST.OPERATION_TYPE.CREATE && res.statusCode === CONST.HTTP_STATUS_CODE.CONFLICT || // PutInstance => unlock in case of 409
               operationType === CONST.OPERATION_TYPE.DELETE && res.statusCode === CONST.HTTP_STATUS_CODE.GONE // DeleteInstance => unlock in case of 410
             ) {
-              return lockManager.unlock(req.params.instance_id)
+              return lockManager.unlock(req.params.instance_id, lockId)
                 .catch(unlockErr => next(unlockErr));
             }
           } else {
-            return lockManager.unlock(req.params.instance_id)
+            return lockManager.unlock(req.params.instance_id, lockId)
               .then(() => {
                 if (err) {
                   if (err instanceof ContinueWithNext) {
@@ -111,10 +118,41 @@ class FabrikBaseController extends BaseController {
     }
   }
 
-  validateDateString(isoDateString) {
-    if (isoDateString && isNaN(Date.parse(isoDateString))) {
-      throw new BadRequest(`Invalid Date String ${isoDateString}`);
+  validateRestoreTimeStamp(epochDateString) {
+    // Here validating 
+    // 1. Requested time stamp should be epoch millisecond.
+    // 2. Requested time should not be older than 14(retention period) days
+    const retentionMillis = config.backup.retention_period_in_days * 24 * 60 * 60 * 1000;
+    const epochRequestDate = Number(epochDateString);
+    if (!epochDateString ||
+      isNaN(epochDateString) ||
+      _.lt(new Date(epochRequestDate), new Date(Date.now() - retentionMillis))) {
+      throw new BadRequest(`Date '${epochDateString}' is not epoch milliseconds or out of range of ${config.backup.retention_period_in_days} days.`);
     }
+  }
+
+  validateRestoreQuota(options) {
+    return this.backupStore
+      .getRestoreFile(options)
+      .then(metdata => {
+        let restoreDates = _.get(metdata, 'restore_dates.succeeded');
+        if (!_.isEmpty(restoreDates)) {
+          _.remove(restoreDates, date => {
+            const dateTillRestoreAllowed = Date.now() - 1000 * 60 * 60 * 24 * config.backup.restore_history_days;
+            return _.lt(new Date(date), new Date(dateTillRestoreAllowed));
+          });
+          //after removing all older restore, 'restoreDates' contains dates within allowed time
+          // dates count should be less than 'config.backup.num_of_allowed_restores'
+          if (restoreDates.length >= config.backup.num_of_allowed_restores) {
+            throw new BadRequest(`Restore allowed only ${config.backup.num_of_allowed_restores} times within ${config.backup.restore_history_days} days.`);
+          }
+        }
+      })
+      .catch(NotFound, (err) => {
+        logger.debug('Not found any restore data.', err);
+        //Restore file might not be found, first time restore.
+        return true;
+      });
   }
 
   ensurePlatformContext(req, res) {
@@ -129,28 +167,6 @@ class FabrikBaseController extends BaseController {
           });
         }
       })
-      .throw(new ContinueWithNext());
-  }
-
-  assignInstance(req, res) {
-    /* jshint unused:false */
-    const instance_id = req.params.instance_id;
-    const service_id = req.body.service_id || req.query.service_id;
-    const plan_id = req.body.plan_id || req.query.plan_id;
-    this.validateUuid(instance_id, 'Service Instance ID');
-    this.validateUuid(service_id, 'Service ID');
-    this.validateUuid(plan_id, 'Plan ID');
-    const encodedOp = _.get(req, 'query.operation', undefined);
-    const operation = encodedOp === undefined ? null : utils.decodeBase64(encodedOp);
-    const context = _.get(req, 'body.context') || _.get(operation, 'context');
-    return this
-      .createInstance(instance_id, service_id, plan_id, context)
-      .tap(instance => _
-        .chain(req)
-        .set('instance', instance)
-        .set('manager', instance.manager)
-        .commit()
-      )
       .throw(new ContinueWithNext());
   }
 
@@ -182,8 +198,8 @@ class FabrikBaseController extends BaseController {
     return this.fabrik.createManager(this.getPlan(plan_id));
   }
 
-  createInstance(instance_id, service_id, plan_id, context) {
-    return this.fabrik.createInstance(instance_id, service_id, plan_id, context);
+  getService(service_id) {
+    return catalog.getService(service_id);
   }
 
   getPlan(plan_id) {

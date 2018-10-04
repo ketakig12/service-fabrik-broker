@@ -29,9 +29,13 @@ class Catalog {
     return service;
   }
 
+  getServiceName(id) {
+    return this.getService(id).name;
+  }
+
   toJSON() {
     return {
-      services: this.services
+      services: _.filter(this.services, service => service.name.indexOf('-fabrik-internal') === -1)
     };
   }
 }

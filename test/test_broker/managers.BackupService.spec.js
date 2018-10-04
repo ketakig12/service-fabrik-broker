@@ -93,39 +93,6 @@ describe('managers', function () {
     });
 
     describe('#startBackup', function () {
-      it('Should cancel staus poller if backup fails', function () {
-        const context = {
-          platform: 'cloudfoundry',
-          organization_guid: organization_guid,
-          space_guid: space_guid
-        };
-        const opts = {
-          guid: backup_guid,
-          deployment: deployment_name,
-          instance_guid: instance_id,
-          plan_id: plan_id,
-          service_id: service_id,
-          context: context
-        };
-        // const type = 'online';
-        mocks.director.getDeploymentVms(deployment_name);
-        mocks.director.getDeploymentInstances(deployment_name);
-        mocks.agent.getInfo();
-        mocks.agent.startBackup();
-        mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
-          status: {
-            state: 'in_progress',
-            response: {}
-          }
-        }, 1, undefined, 404);
-        mocks.apiServerEventMesh.nockPatchResourceStatus('backup', 'defaultbackup', {}, 1);
-        return manager.startBackup(opts)
-          .catch(err => {
-            expect(err.status).to.eql(404);
-            expect(cancelScheduleStub.callCount).to.eql(1);
-            mocks.verify();
-          });
-      });
       it('Should start backup successfully', function () {
         const context = {
           platform: 'cloudfoundry',
@@ -140,12 +107,12 @@ describe('managers', function () {
           service_id: service_id,
           context: context
         };
-        // const type = 'online';
         mocks.director.getDeploymentVms(deployment_name);
         mocks.director.getDeploymentInstances(deployment_name);
         mocks.agent.getInfo();
+        const putFileStub = sinon.stub(BackupStore.prototype, 'putFile');
         mocks.agent.startBackup();
-        mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+        mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
           status: {
             state: 'in_progress',
             response: {}
@@ -166,7 +133,8 @@ describe('managers', function () {
         });
         return manager.startBackup(opts)
           .then(() => {
-            expect(scheduleStub.callCount).to.eql(1);
+            expect(putFileStub.callCount).to.eql(1);
+            putFileStub.restore();
             mocks.verify();
           });
       });
@@ -192,12 +160,12 @@ describe('managers', function () {
           state: 'succeeded',
           agent_ip: mocks.agent.ip
         }));
-        mocks.apiServerEventMesh.nockGetResource('backup', 'defaultbackup', backup_guid, {
+        mocks.apiServerEventMesh.nockGetResource(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, backup_guid, {
           status: {
             response: JSON.stringify('{}')
           }
         });
-        mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {});
+        mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {});
         return manager.getOperationState('backup', opts)
           .then((res) => {
             expect(res.description).to.eql(`Backup deployment ${deployment_name} succeeded at ${finishDate}`);
@@ -223,7 +191,7 @@ describe('managers', function () {
         mocks.cloudProvider.download(pathname, data);
         mocks.cloudProvider.upload(pathname, undefined);
         mocks.cloudProvider.headObject(pathname);
-        mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {}, 1, body => {
+        mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {}, 1, body => {
           const responseObj = JSON.parse(body.status.response);
           expect(responseObj.body).to.eql('value');
           expect(responseObj.logs).to.eql([logobj]);
@@ -231,7 +199,7 @@ describe('managers', function () {
           expect(responseObj.snapshotId).to.eql('fakeSnapshotId');
           return true;
         });
-        mocks.apiServerEventMesh.nockGetResource('backup', 'defaultbackup', backup_guid, {
+        mocks.apiServerEventMesh.nockGetResource(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, backup_guid, {
           status: {
             response: JSON.stringify({
               body: 'value'
@@ -262,7 +230,7 @@ describe('managers', function () {
         context: context,
         guid: backup_guid
       };
-      mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+      mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
         status: {
           state: 'aborting'
         }
@@ -328,7 +296,7 @@ describe('managers', function () {
         mocks.cloudProvider.remove(pathname);
         mocks.cloudProvider.download(pathname, data);
         mocks.apiServerEventMesh.nockLoadSpec();
-        mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+        mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
           status: {
             state: 'deleting'
           }
@@ -351,16 +319,14 @@ describe('managers', function () {
         mocks.cloudProvider.list(container,
           `${prefix}/${service_id}.${instance_id}.${backup_guid}`, [filename]);
         mocks.cloudProvider.download(pathname, scheduled_data);
-        mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+        mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
           status: {
             state: 'deleting'
           }
         }, 1, body => {
           expect(body.status.state).to.eql(CONST.APISERVER.RESOURCE_STATE.DELETE_FAILED);
           const parsed = JSON.parse(body.status.error);
-          expect(parsed.name).to.eql('Forbidden');
           expect(parsed.status).to.eql(403);
-          expect(parsed.reason).to.eql('Forbidden');
           expect(parsed.message).to.eql(`Delete of scheduled backup not permitted within retention period of ${config.backup.retention_period_in_days} days`);
           expect(body.status.response).to.eql(undefined);
           return true;
@@ -382,7 +348,7 @@ describe('managers', function () {
           `${prefix}/${service_id}.${instance_id}.${backup_guid}`, [filename]);
         scheduled_data.started_at = started14DaysPrior;
         mocks.cloudProvider.download(pathname, scheduled_data);
-        mocks.apiServerEventMesh.nockPatchResourceRegex('backup', 'defaultbackup', {
+        mocks.apiServerEventMesh.nockPatchResourceRegex(CONST.APISERVER.RESOURCE_GROUPS.BACKUP, CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP, {
           status: {
             state: 'deleting'
           }

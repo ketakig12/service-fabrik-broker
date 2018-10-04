@@ -40,6 +40,7 @@ exports.deploymentNameRegExp = deploymentNameRegExp;
 exports.getRandomInt = getRandomInt;
 exports.getRandomCronForOnceEveryXDays = getRandomCronForOnceEveryXDays;
 exports.getRandomCronForEveryDayAtXHoursInterval = getRandomCronForEveryDayAtXHoursInterval;
+exports.getCronWithIntervalAndAfterXminute = getCronWithIntervalAndAfterXminute;
 exports.isDBConfigured = isDBConfigured;
 exports.isFeatureEnabled = isFeatureEnabled;
 exports.isServiceFabrikOperation = isServiceFabrikOperation;
@@ -49,6 +50,9 @@ exports.hasChangesInForbiddenSections = hasChangesInForbiddenSections;
 exports.unifyDiffResult = unifyDiffResult;
 exports.getBrokerAgentCredsFromManifest = getBrokerAgentCredsFromManifest;
 exports.initializeEventListener = initializeEventListener;
+exports.buildErrorJson = buildErrorJson;
+exports.deploymentLocked = deploymentLocked;
+exports.deploymentStaggered = deploymentStaggered;
 
 function streamToPromise(stream, options) {
   const encoding = _.get(options, 'encoding', 'utf8');
@@ -365,6 +369,48 @@ function getRandomCronForOnceEveryXDays(days, options) {
   return `${min} ${hr} ${daysApplicable} * *`;
 }
 
+function getCronWithIntervalAndAfterXminute(interval, afterXminute) {
+  afterXminute = afterXminute || 0;
+  const currentTime = new Date().getTime();
+  const timeAfterXMinute = new Date(currentTime + afterXminute * 60 * 1000);
+  const hr = timeAfterXMinute.getHours();
+  const min = timeAfterXMinute.getMinutes();
+
+  if (interval === CONST.SCHEDULE.DAILY) {
+    interval = `${min} ${hr} * * *`;
+  } else if (interval.indexOf('hours') !== -1) {
+    const everyXhrs = parseInt(/^[0-9]+/.exec(interval)[0]);
+    assert.ok((everyXhrs > 0 && everyXhrs <= 24), 'Input hours can be any number between 1 to 24 only');
+    if (everyXhrs === 24) {
+      interval = `${min} ${hr} * * *`;
+    } else {
+      let arrayOfHours = [hr];
+      let nthHour = hr;
+      while (nthHour + everyXhrs < 24) {
+        nthHour = nthHour + everyXhrs;
+        arrayOfHours.push(nthHour);
+      }
+      nthHour = hr;
+      while (nthHour - everyXhrs >= 0) {
+        nthHour = nthHour - everyXhrs;
+        arrayOfHours.push(nthHour);
+      }
+      //This to handle e.g. '7 hours' where 7 doesn't divide 24
+      //then it shoud run in every 7 hours a day including 0
+      if (24 % everyXhrs !== 0 && _.indexOf(arrayOfHours, 0) === -1) {
+        arrayOfHours.push(0);
+      }
+      const hoursApplicable = _.sortBy(arrayOfHours).join(',');
+      interval = `${min} ${hoursApplicable} * * *`;
+    }
+  } else {
+    throw new assert.AssertionError({
+      message: 'interval should \'daily\' or in \'x hours\' format'
+    });
+  }
+  return interval;
+}
+
 function isServiceFabrikOperation(params) {
   return _.get(params.parameters, 'service-fabrik-operation') !== undefined;
 }
@@ -400,9 +446,11 @@ function hasChangesInForbiddenSections(diff) {
     .value();
 
   if (!_.isEmpty(forbiddenSections) && !_.includes(forbiddenSections, 'director_uuid')) {
+    const boshLinks = _.filter(diff, element => _.includes(element[0], 'consumes'));
     const forbiddenSectionsDiff = _.filter(diff, element => _.includes(element[0], 'instances') || _.includes(element[0], 'persistent_disk_type'));
     const removedJobName = findRemovedJob();
-    if (!_.isEmpty(forbiddenSectionsDiff) || removedJobName) {
+    const isDiffForbidden = _.isEmpty(boshLinks) && !_.isEmpty(forbiddenSectionsDiff);
+    if (isDiffForbidden || removedJobName) {
       throw new errors.Forbidden(`Automatic update not possible. ${!_.isEmpty(forbiddenSectionsDiff) ? 'Detected changes in forbidden sections:' + forbiddenSectionsDiff.join(',') : `Job definition removed: ${removedJobName[0]}`}`);
     }
   }
@@ -448,4 +496,26 @@ function getBrokerAgentCredsFromManifest(manifest) {
     });
   });
   return authObject;
+}
+
+function buildErrorJson(err, message) {
+  return {
+    code: err.code,
+    status: err.status,
+    message: message ? message : err.message
+  };
+}
+
+function deploymentLocked(err) {
+  const response = _.get(err, 'error', {});
+  const description = _.get(response, 'description', '');
+  return description.indexOf(CONST.OPERATION_TYPE.LOCK) > 0 &&
+    _.includes([_.get(err, 'status'), _.get(err, 'statusCode'), _.get(response, 'status')], CONST.HTTP_STATUS_CODE.UNPROCESSABLE_ENTITY);
+}
+
+
+function deploymentStaggered(err) {
+  const response = _.get(err, 'error', {});
+  const description = _.get(response, 'description', '');
+  return description.indexOf(CONST.FABRIK_OPERATION_STAGGERED) > 0 && description.indexOf(CONST.FABRIK_OPERATION_COUNT_EXCEEDED) > 0;
 }

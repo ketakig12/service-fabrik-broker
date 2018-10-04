@@ -32,7 +32,7 @@ class BackupStore {
     return _.nth(/^(.+)-broker$/.exec(this.containerName), 1);
   }
 
-  listFilenames(prefix, predicate, iteratees) {
+  listFilenames(prefix, predicate, iteratees, container, dontParseFilename) {
     const options = {
       prefix: prefix
     };
@@ -45,8 +45,7 @@ class BackupStore {
       level++;
       logger.debug(`Fetching recursively at level : ${level}`);
       const promise = new Promise(function (resolve, reject) {
-        self.cloudProvider
-          .list(options)
+        Promise.try(() => container ? self.cloudProvider.list(container, options) : self.cloudProvider.list(options))
           .then(files => {
             logger.debug('list of files recieved - ', files);
             if (files && files.length > 0) {
@@ -72,7 +71,7 @@ class BackupStore {
       .then(() =>
         _
         .chain(fileList)
-        .map(file => this.filename.parse(file.name))
+        .map(file => dontParseFilename ? file : this.filename.parse(file.name))
         .filter(predicate)
         .sortBy(iteratees)
         .value());
@@ -139,7 +138,9 @@ class BackupStore {
         .uploadJson(filename, _
           .chain(data)
           .assign(newData)
-          .set('finished_at', this.filename.isoDate())
+          .set('finished_at',
+            _.get(newData, 'finished_at') ?
+            new Date(_.get(newData, 'finished_at')).toISOString() : new Date().toISOString())
           .value()
         )
       );
@@ -249,9 +250,18 @@ class BackupStore {
       .then(isoDate => this.listFilenames(this.getFileNamePrefix(options), getPredicate(isoDate), iteratees));
   }
 
-  listBackupsOlderThan(options, daysPrior) {
+  listBackupsOlderThan(options, dateOrDaysOlderThan) {
     const iteratees = ['started_at'];
-    const backupStartedBefore = moment().subtract(daysPrior, 'days').toISOString();
+
+    let backupStartedBefore;
+    // The following check made accept dateOlderThan as both formats
+    // 1. number: (say older than 14 days)
+    // 2. date: any date format which can be parsed javascript Date interface
+    if (Number.isInteger(dateOrDaysOlderThan)) {
+      backupStartedBefore = moment().subtract(dateOrDaysOlderThan, 'days').toISOString();
+    } else {
+      backupStartedBefore = dateOrDaysOlderThan;
+    }
 
     function getPredicate(isoDate) {
       return function predicate(filenameobject) {
@@ -263,6 +273,36 @@ class BackupStore {
     return Promise
       .try(() => this.filename.isoDate(backupStartedBefore))
       .then(isoDate => this.listBackupFiles(options, getPredicate(isoDate), iteratees));
+  }
+
+  listTransactionLogsOlderThan(options, dateOlderThan) {
+    const iteratees = ['lastModified'];
+    const prefix = `${options.service_name}/logs/${options.instance_id}`;
+    const container = `${this.containerPrefix}-${options.service_name}`;
+
+    function getPredicate(isoDate) {
+      return function predicate(filenameobject) {
+        //transactionLogsDeletionStartDate defaults to current timestamp as part of isoDate function.
+        return _.lt(new Date(filenameobject.lastModified).toISOString(), isoDate);
+      };
+    }
+    return Promise
+      .try(() => this.filename.isoDate(dateOlderThan))
+      .then(isoDate => this.listFilenames(prefix, getPredicate(isoDate), iteratees, container, true));
+  }
+
+  deleteTransactionLogsOlderThan(options, dateOlderThan) {
+    let deletedTransactionLogFilesCount = 0;
+    const container = `${this.containerPrefix}-${options.service_name}`;
+
+    return this.listTransactionLogsOlderThan(options, dateOlderThan)
+      .tap(transactionLogsFiles => {
+        if (!_.isEmpty(transactionLogsFiles)) {
+          deletedTransactionLogFilesCount = transactionLogsFiles.length;
+        }
+      })
+      .map(transactionLogsFile => this.cloudProvider.remove(container, transactionLogsFile.name))
+      .then(() => deletedTransactionLogFilesCount);
   }
 }
 

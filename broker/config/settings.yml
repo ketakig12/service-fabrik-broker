@@ -5,7 +5,14 @@
 const path = require('path');
 const os = require('os');
 
-const log_path = path.join(__dirname, '../..', 'logs', `${process.env.NODE_ENV}.log`)
+let filePrefix = '';
+if(process && process.argv[1] && process.argv[1].indexOf('.js') !== -1){
+  const exeName = process.argv[1].substring(process.argv[1].lastIndexOf('/')+1, process.argv[1].indexOf('.js'));
+  if(exeName && exeName !== ''){
+    filePrefix = `${exeName}-`;
+  }
+}
+const log_path = path.join(__dirname, '../..', 'logs', `${filePrefix}${process.env.NODE_ENV}.log`)
 
 const broker_name = 'service-fabrik-broker';
 const ip = '10.0.2.2';
@@ -152,9 +159,10 @@ defaults: &defaults
   # this timeout is set to 175 secs by default because CF has a default timeout of 180 secs
   http_timeout: 175000
   deployment_action_timeout: 80000
+  # (milliseconds) this time out can be used any operation done on broker agent
+  agent_operation_timeout: 35000
   multi_az_enabled: false
   broker_drain_message: 'BROKER_DRAIN_INITIATED'
-  
   ##############################
   # EXTERNAL ENDPOINT SETTINGS #
   ##############################
@@ -186,7 +194,27 @@ defaults: &defaults
     ssl:
       key: <%= certificate('broker.key') %>
       cert: <%= certificate('broker.crt') %>
-
+  ##############################
+  # APISERVER SETTINGS #
+  ##############################
+  apiserver:
+    ip: '10.244.14.252'
+    port: 8443
+    encryption:
+      key: 'ABCDEFGHABCDEFGHABCDEFGHABCDEFGH'
+      initialization_vector: 'ABCDEFGHABCDEFGH'
+    certificate: <%= certificate('apiserver.crt') %>
+    private_key: <%= certificate('apiserver.key') %>
+    crds:
+      "deployment.servicefabrik.io_v1alpha1_directors.yaml": <%=base64_template('crds/deployment.servicefabrik.io_v1alpha1_directors.yaml') %>
+      "lock.servicefabrik.io_v1alpha1_deploymentlocks.yaml": <%= base64_template('crds/lock.servicefabrik.io_v1alpha1_deploymentlocks.yaml') %>
+      "backup.servicefabrik.io_v1alpha1_defaultrestores.yaml": <%= base64_template('crds/backup.servicefabrik.io_v1alpha1_defaultrestores.yaml') %>
+      "bind.servicefabrik.io_v1alpha1_directorbinds.yaml": <%= base64_template('crds/bind.servicefabrik.io_v1alpha1_directorbinds.yaml') %>
+      "bind.servicefabrik.io_v1alpha1_dockerbinds.yaml": <%= base64_template('crds/bind.servicefabrik.io_v1alpha1_dockerbinds.yaml') %>
+      "backup.servicefabrik.io_v1alpha1_defaultbackups.yaml": <%= base64_template('crds/backup.servicefabrik.io_v1alpha1_defaultbackups.yaml') %>
+      "deployment.servicefabrik.io_v1alpha1_dockers.yaml": <%= base64_template('crds/deployment.servicefabrik.io_v1alpha1_dockers.yaml') %>
+      "deployment.servicefabrik.io_v1alpha1_virtualhosts.yaml": <%= base64_template('crds/deployment.servicefabrik.io_v1alpha1_virtualhosts.yaml') %>
+      "bind.servicefabrik.io_v1alpha1_virtualhostbinds.yaml": <%= base64_template('crds/bind.servicefabrik.io_v1alpha1_virtualhostbinds.yaml') %>
 
   ##############################
   # REPORT ENDPOINT SETTINGS #
@@ -248,7 +276,13 @@ defaults: &defaults
       schedule_interval: 0 12 * * * #Backup schedule interval for service fabrik DB
       status_check_every: 120000 # (ms) Check the status of service fabrik backup once every 2 mins
       backup_timeout_time: 7200000 # (ms) Service Fabrik backup must finish within this timeout time (2 hrs)
-
+  ######################
+  # APISERVER LOCK TTL #
+  ######################
+  lockttl:
+    lifecycle: 86400 # in sec(1 day)
+    backup: 86400 # in sec(1 days)
+    restore: 86400 # in sec(1 days)
   ######################
   # SCHEDULER SETTINGS #
   ######################
@@ -368,6 +402,11 @@ defaults: &defaults
     backup_restore_status_check_every: 120000 # (ms) Check the status of deployment backup/restore once every 2 mins
     abort_time_out: 300000 #(ms) Timeout time for abort of backup to complete
     consecutive_backup_failure_sla_count: 3 # Max allowed no backup days in a row
+    num_of_allowed_restores: 10 # Number of allowed restores in restore_history_days
+    restore_history_days: 30 # Max allowed restores  10 in 30 days
+    reschedule_backup_delay_after_restore: 3 #(minute)
+    transaction_logs_delete_buffer_time: 10 #(minute)
+
     provider:
       name: openstack
       authUrl: <%= cloudProvider.authUrl %>
@@ -406,17 +445,6 @@ defaults: &defaults
     username: admin
     password: admin
   
-  #############################
-  # CREDHUB SETTINGS #
-  #############################
-  cred_provider:
-    credhub_url: https://10.0.3.11:8443/api/
-    credhub_uaa_url: https://10.0.3.11:8443
-    credhub_client_id:  credhub-admin
-    credhub_client_secret: 
-    credhub_username: admin
-    credhub_user_password: admin
-
   ###################
   # DOCKER SETTINGS #
   ###################
@@ -472,6 +500,11 @@ defaults: &defaults
         - { range: 10.244.10.0/24, az: z1, cloud_properties: { name: random } }
         - { range: 10.244.11.0/24, az: z2, cloud_properties: { name: random } }
         - { range: 10.244.12.0/24, az: z3, cloud_properties: { name: random } }
+    uaa:
+      uaa_auth: false #make it true if bosh uses UAA for authentication
+      uaa_url: '' #provide complete uaa url here.,e.g., https://192.168.48.6:8443
+      client_id: '' #Assuming client credential grant being used, provide client id here
+      client_secret: '' #provide corrsponding client secret 
   - cpi: warden_cpi
     url: https://192.168.50.4:25555
     username: admin
@@ -517,10 +550,13 @@ defaults: &defaults
       - lifecycle
       - credentials
       - multi_tenancy
-  ########################################
-  # SERVICES CATALOG - BLUEPRINT SERVICE #
-  ########################################
+  ####################
+  # SERVICES CATALOG #
+  ####################
   services:
+  #####################
+  # BLUEPRINT SERVICE #
+  #####################
   - &blueprint_service
     id: '24731fb8-7b84-4f57-914f-c3d55d793dd4'
     name: 'blueprint'
@@ -544,6 +580,8 @@ defaults: &defaults
     - k8s
     - cf
     actions: Blueprint
+    backup_interval: '8 hours'
+    pitr: true
     plans:
     ###########################
     # CONTAINER SERVICE PLANS #
@@ -554,6 +592,13 @@ defaults: &defaults
       free: true
       manager:
         name: 'docker'
+        async: false
+        resource_mappings: &docker_resource_mappings
+          resource_group: 'deployment.servicefabrik.io'
+          resource_type: 'dockers'
+          bind:
+            resource_group: 'bind.servicefabrik.io'
+            resource_type: 'dockerbinds'
         settings:
           image: 'servicefabrikjenkins/blueprint'
           tag: 'latest'
@@ -586,6 +631,8 @@ defaults: &defaults
       free: true
       manager:
         name: 'docker'
+        async: false
+        resource_mappings: *docker_resource_mappings
         settings:
           image: 'servicefabrikjenkins/blueprint'
           tag: 'latest'
@@ -618,6 +665,8 @@ defaults: &defaults
       free: true
       manager:
         name: 'docker'
+        async: false
+        resource_mappings: *docker_resource_mappings
         settings:
           image: 'servicefabrikjenkins/blueprint'
           tag: 'latest'
@@ -652,9 +701,24 @@ defaults: &defaults
       id: 'bc158c9a-7934-401e-94ab-057082a5073f'
       name: 'v1.0-xsmall'
       free: false
+      # Asynch operations which supports parallel synch operations
+      # e.g. bind and unbind (sync) supported during update and backup (async)
+      async_ops_supporting_parallel_sync_ops: &async_ops_supporting_parallel_sync_ops
+      - 'update'
+      - 'backup'
       actions: ReserveIps
       manager: &manager_plan3
         name: 'director'
+        async: true
+        resource_mappings: &director_resource_mappings
+          resource_group: 'deployment.servicefabrik.io'
+          resource_type: 'directors'
+          bind:
+            resource_group: 'bind.servicefabrik.io'
+            resource_type: 'directorbinds'
+          backup:
+            resource_group: 'backup.servicefabrik.io'
+            resource_type: 'defaultbackups'
         settings: &settings_plan3
           prefix: 'blueprint'
           agent: *agent_blueprint
@@ -687,6 +751,8 @@ defaults: &defaults
       free: false
       manager: &manager_plan4
         name: 'director'
+        async: true
+        resource_mappings: *director_resource_mappings
         settings: &settings_plan4
           prefix: 'blueprint'
           agent: *agent_blueprint
@@ -719,6 +785,8 @@ defaults: &defaults
       free: false
       manager: &manager_plan5
         name: 'director'
+        async: true
+        resource_mappings: *director_resource_mappings
         settings: &settings_plan5
           prefix: 'blueprint'
           agent: *agent_blueprint
@@ -752,6 +820,8 @@ defaults: &defaults
       free: false
       manager: &manager_plan7
         name: 'director'
+        async: true
+        resource_mappings: *director_resource_mappings
         settings: &settings_plan7
           prefix: 'blueprint'
           agent: *agent_blueprint
@@ -784,6 +854,8 @@ defaults: &defaults
       free: false
       manager: &manager_plan6
         name: 'director'
+        async: true
+        resource_mappings: *director_resource_mappings
         settings: &settings_plan6
           prefix: 'blueprint'
           agent: *agent_blueprint
@@ -840,21 +912,85 @@ defaults: &defaults
       id: 'b715f834-2048-11e7-a560-080027afc1e6'
       name: 'v3.6-xsmall'
       free: false
+      # Asynch operations which supports parallel synch operations
+      # e.g. bind and unbind (sync) supported during update and backup (async)
+      supported_operations: *async_ops_supporting_parallel_sync_ops
       manager: &manager_plan9
         name: 'director'
+        async: true
+        resource_mappings: *director_resource_mappings
         settings: &settings_plan9
           prefix: 'rabbitmq'
           agent: *agent_rabbitmq
           template: <%= base64_template('templates/rabbitmq-manifest.yml.ejs') %>
           releases: &dedicated_releases
-          - { name: rabbitmq, version: 16 }
+          - { name: rabbitmq, version: 25 }
           # An agent running in the deployment should implement Service Fabrik Agent APIs listed here https://cloudfoundry-incubator.github.io/service-fabrik-broker/api/agent_v1.1.html
-          - { name: broker-agent-rabbitmq, version: 26 }
+          - { name: broker-agent-rabbitmq, version: 36 }
           context: &context_plan9
             agent: *agent_rabbitmq
-            resource_pool: micro
-            disk_pool: hdd_1gb
+            disk_type: 1GB
+            vm_type: default
+            rabbitmq:
+              instances: 3
+              version: "3.6"
+              vm_type: minimal
+              disk_type: 1GB
+              mqtt_enabled: false
+              stomp_enabled: false
+              amqp1_0_enabled: false
+              policy_definition: {"ha-mode":"all","ha-sync-mode":"automatic"}
+            erlang:
+              version: "19.3"
+            haproxy:
+              vm_type: minimal
+              disk_type: 1GB
       description: 'RabbitMQ 3.6 service x-small'
+      metadata:
+        costs:
+        - amount:
+            usd: 0.0
+          unit: 'MONTHLY'
+        bullets:
+        - 'Dedicated Deployment'
+        - '3 Node Cluster'
+        - '1 GB Memory'
+        - '10 GB Disk'
+    - &rabbitmq_plan2
+      id: '0c59fe4b-7b2d-4db9-9a9f-8a889a592652'
+      name: 'v3.7-xsmall'
+      free: false
+      manager: &manager_plan10
+        name: 'director'
+        async: true
+        resource_mappings: *director_resource_mappings
+        settings: &settings_plan10
+          prefix: 'rabbitmq'
+          agent: *agent_rabbitmq
+          template: <%= base64_template('templates/rabbitmq-manifest.yml.ejs') %>
+          releases: &dedicated_releases
+          - { name: rabbitmq, version: 25 }
+          # An agent running in the deployment should implement Service Fabrik Agent APIs listed here https://cloudfoundry-incubator.github.io/service-fabrik-broker/api/agent_v1.1.html
+          - { name: broker-agent-rabbitmq, version: 36 }
+          context: &context_plan9
+            agent: *agent_rabbitmq
+            disk_type: 1GB
+            vm_type: default
+            rabbitmq:
+              instances: 3
+              version: "3.7"
+              vm_type: minimal
+              disk_type: 1GB
+              mqtt_enabled: false
+              stomp_enabled: false
+              amqp1_0_enabled: false
+              policy_definition: {"ha-mode":"all","ha-sync-mode":"automatic"}
+            erlang:
+              version: "20.3"
+            haproxy:
+              vm_type: minimal
+              disk_type: 1GB
+      description: 'RabbitMQ 3.7 service x-small'
       metadata:
         costs:
         - amount:
@@ -871,10 +1007,16 @@ defaults: &defaults
     ###########################
     - &shared_plan1
       id: 'd035f948-5d3a-43d7-9aec-954e134c3e9d'
-      name: 'virtual_host'
+      name: 'virtualhost'
       free: true
       manager: &virtual_host_manager
         name: 'virtual_host'
+        resource_mappings:
+          resource_group: 'deployment.servicefabrik.io'
+          resource_type: 'virtualhosts'
+          bind:
+            resource_group: 'bind.servicefabrik.io'
+            resource_type: 'virtualhostbinds'
         settings: &settings_virtual_host
           prefix: 'rabbitmq'
           agent: *agent_rabbitmq

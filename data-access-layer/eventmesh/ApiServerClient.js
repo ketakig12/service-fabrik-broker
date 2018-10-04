@@ -3,6 +3,7 @@
 const _ = require('lodash');
 const Promise = require('bluebird');
 const assert = require('assert');
+const yaml = require('js-yaml');
 const config = require('../../common/config');
 const logger = require('../../common/logger');
 const CONST = require('../../common/constants');
@@ -17,7 +18,9 @@ const InternalServerError = errors.InternalServerError;
 
 const apiserver = new kc.Client({
   config: {
-    url: `https://${config.internal.ip}:${CONST.APISERVER.PORT}`,
+    url: `https://${config.apiserver.ip}:${config.apiserver.port}`,
+    cert: config.apiserver.certificate,
+    key: config.apiserver.private_key,
     insecureSkipTlsVerify: true
   },
   version: CONST.APISERVER.VERSION
@@ -48,6 +51,9 @@ function convertToHttpErrorAndThrow(err) {
   case CONST.HTTP_STATUS_CODE.FORBIDDEN:
     newErr = new errors.Forbidden(message);
     break;
+  case CONST.HTTP_STATUS_CODE.GONE:
+    newErr = new errors.Gone(message);
+    break;
   default:
     newErr = new InternalServerError(message);
     break;
@@ -64,68 +70,66 @@ class ApiServerClient {
   init() {
     return Promise.try(() => {
       if (!this.ready) {
-        return apiserver.loadSpec()
+        return Promise.map(_.values(config.apiserver.crds), crdTemplate => {
+            apiserver.addCustomResourceDefinition(yaml.safeLoad(Buffer.from(crdTemplate, 'base64')));
+          })
+          .then(() => apiserver.loadSpec())
           .then(() => {
             this.ready = true;
-            logger.info('Loaded Successfully');
+            logger.debug('Successfully loaded ApiServer Spec');
+          })
+          .catch(err => {
+            logger.error('Error occured while loading ApiServer Spec', err);
+            return convertToHttpErrorAndThrow(err);
           });
       }
     });
   }
-
   /**
    * Poll for Status until opts.start_state changes
    * @param {object} opts - Object containing options
-   * @param {string} opts.operationId - Id of the operation ex. backupGuid
+   * @param {string} opts.resourceGroup - Name of resource group ex. backup.servicefabrik.io
+   * @param {string} opts.resourceType - Type of resource ex. defaultbackup
+   * @param {string} opts.resourceId - Id of the operation ex. backupGuid
    * @param {string} opts.start_state - start state of the operation ex. in_queue
    * @param {object} opts.started_at - Date object specifying operation start time
    */
   getResourceOperationStatus(opts) {
-    logger.info(`Waiting ${CONST.EVENTMESH_POLLER_DELAY} ms to get the operation state`);
+    logger.debug(`Waiting ${CONST.EVENTMESH_POLLER_DELAY} ms to get the operation state`);
     let finalState;
     return Promise.delay(CONST.EVENTMESH_POLLER_DELAY)
-      .then(() => this.getOperationState({
-        operationName: CONST.OPERATION_TYPE.BACKUP,
-        operationType: CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP,
-        operationId: opts.operationId
+      .then(() => this.getResource({
+        resourceGroup: opts.resourceGroup,
+        resourceType: opts.resourceType,
+        resourceId: opts.resourceId
       }))
-      .then(state => {
+      .then(resource => {
+        const state = _.get(resource, 'status.state');
         if (state === opts.start_state) {
+          const duration = (new Date() - opts.started_at) / 1000;
+          logger.debug(`Polling for ${opts.start_state} duration: ${duration} `);
+          if (duration > CONST.APISERVER.OPERATION_TIMEOUT_IN_SECS) {
+            logger.error(`${opts.resourceGroup} with guid ${opts.resourceId} not yet processed`);
+            throw new Timeout(`${opts.resourceGroup} with guid ${opts.resourceId} not yet processed`);
+          }
           return this.getResourceOperationStatus(opts);
         } else if (
           state === CONST.APISERVER.RESOURCE_STATE.FAILED ||
           state === CONST.APISERVER.RESOURCE_STATE.DELETE_FAILED
         ) {
           finalState = state;
-          return this.getOperationStatus({
-              operationName: CONST.OPERATION_TYPE.BACKUP,
-              operationType: CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP,
-              operationId: opts.operationId,
-            })
-            .then(status => {
-              if (status.error) {
-                const errorResponse = JSON.parse(status.error);
-                logger.info('Operation manager reported error', errorResponse);
-                return convertToHttpErrorAndThrow(errorResponse);
-              }
-            });
+          if (_.get(resource, 'status.error')) {
+            const errorResponse = _.get(resource, 'status.error');
+            logger.info('Operation manager reported error', errorResponse);
+            return convertToHttpErrorAndThrow(errorResponse);
+          }
         } else {
           finalState = state;
-          const duration = (new Date() - opts.started_at) / 1000;
-          logger.info(`Polling for ${opts.start_state} duration: ${duration} `);
-          if (duration > CONST.BACKUP.BACKUP_START_TIMEOUT_IN_SECS) {
-            logger.error(`Backup with guid ${opts.operationId} not picked up from the queue`);
-            throw new Timeout(`Backup with guid ${opts.operationId} not picked up from the queue`);
-          }
-          return this.getOperationResponse({
-            operationName: CONST.OPERATION_TYPE.BACKUP,
-            operationType: CONST.APISERVER.RESOURCE_TYPES.DEFAULT_BACKUP,
-            operationId: opts.operationId,
-          });
+          return _.get(resource, 'status.response');
         }
       })
       .then(result => {
-        if (result.state) {
+        if (_.get(result, 'state')) {
           return result;
         }
         return {
@@ -135,6 +139,7 @@ class ApiServerClient {
       });
   }
 
+
   /**
    * @description Register watcher for (resourceGroup , resourceType)
    * @param {string} resourceGroup - Name of the resource
@@ -142,224 +147,118 @@ class ApiServerClient {
    * @param {string} callback - Fucntion to call when event is received
    */
   registerWatcher(resourceGroup, resourceType, callback, queryString) {
+    assert.ok(resourceGroup, `Argument 'resourceGroup' is required to register watcher`);
+    assert.ok(resourceType, `Argument 'resourceType' is required to register watcher`);
     return Promise.try(() => this.init())
       .then(() => {
         const stream = apiserver
-          .apis[`${resourceGroup}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-          .watch.namespaces(CONST.APISERVER.NAMESPACE)[resourceType].getStream({
+          .apis[resourceGroup][CONST.APISERVER.API_VERSION]
+          .watch[resourceType].getStream({
             qs: {
-              labelSelector: queryString ? queryString : ''
+              labelSelector: queryString ? queryString : '',
+              timeoutSeconds: CONST.APISERVER.WATCH_TIMEOUT
             }
           });
         const jsonStream = new JSONStream();
         stream.pipe(jsonStream);
         jsonStream.on('data', callback);
-        jsonStream.on('error', err => {
-          logger.error('Error occured during watching', err);
-          this.registerWatcher(resourceGroup, resourceType, callback, queryString);
-          //throw err;
-        });
         return stream;
       })
       .catch(err => {
         return convertToHttpErrorAndThrow(err);
       });
   }
-
   parseResourceDetailsFromSelfLink(selfLink) {
     // self links are typically: /apis/deployment.servicefabrik.io/v1alpha1/namespaces/default/directors/d-7
     const resourceType = _.split(selfLink, '/')[6];
-    const resourceGroup = _.split(_.split(selfLink, '/')[2], '.')[0];
+    const resourceGroup = _.split(selfLink, '/')[2];
     return {
       resourceGroup: resourceGroup,
       resourceType: resourceType
     };
   }
 
-  _createResource(resourceGroup, resourceType, body) {
+  registerCrds(resourceGroup, resourceType) {
+    logger.info(`Registering CRDs for ${resourceGroup}, ${resourceType}`);
+    const crdJson = this.getCrdJson(resourceGroup, resourceType);
     return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${resourceGroup}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[resourceType].post({
-          body: body
-        }));
-  }
-
-  createLock(lockType, body) {
-    return this._createResource(CONST.APISERVER.RESOURCE_GROUPS.LOCK, lockType, body)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  deleteResource(resourceGroup, resourceType, resourceId) {
-    return Promise.try(() => this.init())
-      .then(() => apiserver.apis[`${resourceGroup}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[resourceType](resourceId).delete());
-  }
-
-  patchResource(resourceGroup, resourceType, resourceId, delta) {
-    return Promise.try(() => this.init())
-      .then(() => apiserver.apis[`${resourceGroup}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[resourceType](resourceId).patch({
-          body: delta
-        }));
-  }
-
-  patchResourceStatus(resourceGroup, resourceType, resourceId, statusDelta) {
-    return Promise.try(() => this.init())
-      .then(() => apiserver.apis[`${resourceGroup}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[resourceType](resourceId)
-        .status.patch({
-          body: statusDelta
-        }));
-  }
-
-  deleteLock(resourceType, resourceId) {
-    return this.deleteResource(CONST.APISERVER.RESOURCE_GROUPS.LOCK, resourceType, resourceId)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  updateResource(resourceGroup, resourceType, resourceId, delta) {
-    return this.patchResource(resourceGroup, resourceType, resourceId, delta)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  getLockDetails(resourceType, resourceId) {
-    return Promise.try(() => this.init())
-      .then(() => apiserver.apis[`${CONST.APISERVER.RESOURCE_GROUPS.LOCK}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[resourceType](resourceId).get())
-      .then(resource => {
-        return JSON.parse(resource.body.spec.options);
+      .then(() => {
+        return apiserver.apis[CONST.APISERVER.CRD_RESOURCE_GROUP].v1beta1.customresourcedefinitions(crdJson.metadata.name).patch({
+            body: crdJson,
+            headers: {
+              'content-type': CONST.APISERVER.PATCH_CONTENT_TYPE
+            }
+          })
+          .catch(err => {
+            return convertToHttpErrorAndThrow(err);
+          });
+      })
+      .catch(NotFound, () => {
+        logger.info(`CRD with resourcegroup ${resourceGroup} and resource ${resourceType} not yet registered, registering it now..`);
+        return apiserver.apis[CONST.APISERVER.CRD_RESOURCE_GROUP].v1beta1.customresourcedefinitions.post({
+          body: crdJson
+        });
       })
       .catch(err => {
         return convertToHttpErrorAndThrow(err);
       });
   }
 
-  getResource(resourceGroup, resourceType, resourceId) {
-    logger.debug(`Getting resource ${resourceGroup}/${resourceType}/${resourceId}`);
-    return Promise.try(() => this.init())
-      .then(() => apiserver.apis[`${resourceGroup}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[resourceType](resourceId).get())
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  createDeployment(resourceId, val) {
-    const opts = {
-      operationId: resourceId,
-      resourceId: resourceId,
-      operationName: CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT,
-      operationType: CONST.APISERVER.RESOURCE_TYPES.DIRECTOR,
-      value: val
-    };
-    return this.createOperation(opts);
-  }
-
-  _updateResourceState(resourceType, resourceId, stateValue) {
-    const opts = {
-      operationId: resourceId,
-      resourceId: resourceId,
-      operationName: CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT,
-      operationType: resourceType,
-      stateValue: stateValue
-    };
-    return this.updateOperationState(opts);
-  }
-
-  getResourceState(resourceType, resourceId) {
-    return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[resourceType](resourceId)
-        .get())
-      .then(json => json.body.status.state)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
+  getCrdJson(resourceGroup, resourceType) {
+    const crdEncodedTemplate = config.apiserver.crds[`${resourceGroup}_${CONST.APISERVER.API_VERSION}_${resourceType}.yaml`];
+    logger.debug(`Getting crd json for: ${resourceGroup}_${CONST.APISERVER.API_VERSION}_${resourceType}.yaml`);
+    return yaml.safeLoad(Buffer.from(crdEncodedTemplate, 'base64'));
   }
 
   /**
    * @description Create Resource in Apiserver with the opts
-   * @param {string} opts.resourceId - Unique id of resource
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.value - Value to set for spec.options field of resource
+   * @param {string} opts.resourceGroup - Name of resource group ex. backup.servicefabrik.io
+   * @param {string} opts.resourceType - Type of resource ex. defaultbackup
+   * @param {string} opts.resourceId - Unique id of resource ex. backup_guid
+   * @param {string} opts.labels - to be put in label ex: instance_guid
+   * @param {Object} opts.options - Value to set for spec.options field of resource
+   * @param {string} opts.status - status of the resource
    */
-  createOperation(opts) {
+  createResource(opts) {
+    logger.info(`Creating resource with opts: `, opts);
+    assert.ok(opts.resourceGroup, `Property 'resourceGroup' is required to create resource`);
+    assert.ok(opts.resourceType, `Property 'resourceType' is required to create resource`);
+    assert.ok(opts.resourceId, `Property 'resourceId' is required to create resource`);
+    assert.ok(opts.options, `Property 'options' is required to create resource`);
+    const metadata = {
+      name: opts.resourceId
+    };
+    if (opts.labels) {
+      // TODO-PR: revisit key name instance_guid
+      metadata.labels = opts.labels;
+    }
+    const crdJson = this.getCrdJson(opts.resourceGroup, opts.resourceType);
     const resourceBody = {
-      metadata: {
-        'name': `${opts.operationId}`,
-        'labels': {
-          instance_guid: `${opts.resourceId}`,
-        },
-      },
+      apiVersion: `${crdJson.spec.group}/${crdJson.spec.version}`,
+      kind: crdJson.spec.names.kind,
+      metadata: metadata,
       spec: {
-        'options': JSON.stringify(opts.value)
+        'options': JSON.stringify(opts.options)
       },
     };
-    logger.info(`Creating resource ${resourceBody.metadata.name} with options:`, opts.value);
-    const statusJson = {
-      status: {
-        state: CONST.APISERVER.RESOURCE_STATE.IN_QUEUE,
-        lastOperation: 'created',
-        response: JSON.stringify({})
-      }
-    };
-    return this._createResource(opts.operationName, opts.operationType, resourceBody)
-      .then(() => apiserver.apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId).status.patch({
-          body: statusJson
-        }))
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
 
-  /**
-   * @description Function to patch the response filed with opts.value
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.value - Object to merge with the existing Result object
-   */
-  patchOperationResponse(opts) {
-    logger.info('Patching Operation with :', opts);
-    return this.getOperationResponse(opts)
-      .then(res => {
-        logger.info(`Patching ${JSON.stringify(res)} with ${JSON.stringify(opts.value)}`);
-        opts.value = _.merge(res, opts.value);
-        return this.updateOperationResponse(opts);
+    if (opts.status) {
+      const statusJson = {};
+      _.forEach(opts.status, (val, key) => {
+        if (key === 'state') {
+          resourceBody.metadata.labels = _.merge(resourceBody.metadata.labels, {
+            'state': val
+          });
+        }
+        statusJson[key] = _.isObject(val) ? JSON.stringify(val) : val;
       });
-  }
-
-  /**
-   * @description Function to update the response field
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.value - Object to be set as status.response
-   */
-  updateOperationResponse(opts) {
-    logger.info('Updating Operation Result with :', opts);
-    const patchedResource = {
-      'status': {
-        'response': JSON.stringify(opts.value),
-      }
-    };
+      resourceBody.status = statusJson;
+    }
     return Promise.try(() => this.init())
       .then(() => apiserver
-        .apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId)
-        .status.patch({
-          body: patchedResource
+        .apis[opts.resourceGroup][CONST.APISERVER.API_VERSION]
+        .namespaces(CONST.APISERVER.NAMESPACE)[opts.resourceType].post({
+          body: resourceBody
         }))
       .catch(err => {
         return convertToHttpErrorAndThrow(err);
@@ -367,77 +266,101 @@ class ApiServerClient {
   }
 
   /**
-   * @description Function to Update the state field
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.stateValue - Value to set as state
+   * @description Update Resource in Apiserver with the opts
+   * @param {string} opts.resourceGroup - Name of resource group ex. backup.servicefabrik.io
+   * @param {string} opts.resourceType - Type of resource ex. defaultbackup
+   * @param {string} opts.resourceId - Unique id of resource ex. backup_guid
+   * @param {string} opts.metadata - Metadata of resource
+   * @param {Object} opts.options - Value to set for spec.options field of resource
+   * @param {string} opts.status - status of the resource
    */
-  updateOperationState(opts) {
-    logger.info('Updating Operation State with :', opts);
-    assert.ok(opts.operationName, `Property 'operationName' is required to update operation state`);
-    assert.ok(opts.operationType, `Property 'operationType' is required to update operation state`);
-    assert.ok(opts.operationId, `Property 'operationId' is required to update operation state`);
-    assert.ok(opts.stateValue, `Property 'stateValue' is required to update operation state`);
-    const patchedResource = {
-      'status': {
-        'state': opts.stateValue
-      }
-    };
+  updateResource(opts) {
+    logger.info('Updating resource with opts: ', opts);
+    assert.ok(opts.resourceGroup, `Property 'resourceGroup' is required to update resource`);
+    assert.ok(opts.resourceType, `Property 'resourceType' is required to update resource`);
+    assert.ok(opts.resourceId, `Property 'resourceId' is required to update resource`);
+    assert.ok(opts.metadata || opts.options || opts.status, `Property 'metadata' or 'options' or 'status' is required to update resource`);
+    return Promise.try(() => {
+        const patchBody = {};
+        if (opts.metadata) {
+          patchBody.metadata = opts.metadata;
+        }
+        if (opts.options) {
+          patchBody.spec = {
+            'options': JSON.stringify(opts.options)
+          };
+        }
+        if (opts.status) {
+          const statusJson = {};
+          _.forEach(opts.status, (val, key) => {
+            if (key === 'state') {
+              patchBody.metadata = _.merge(patchBody.metadata, {
+                labels: {
+                  'state': val
+                }
+              });
+            }
+            statusJson[key] = _.isObject(val) ? JSON.stringify(val) : val;
+          });
+          patchBody.status = statusJson;
+        }
+        return Promise.try(() => this.init())
+          .then(() => apiserver
+            .apis[opts.resourceGroup][CONST.APISERVER.API_VERSION]
+            .namespaces(CONST.APISERVER.NAMESPACE)[opts.resourceType](opts.resourceId).patch({
+              body: patchBody,
+              headers: {
+                'content-type': CONST.APISERVER.PATCH_CONTENT_TYPE
+              }
+            }));
+      })
+      .catch(err => {
+        return convertToHttpErrorAndThrow(err);
+      });
+  }
+  /**
+   * @description Patches Resource in Apiserver with the opts
+   * Use this method when you want to append something in status.response or spec.options
+   * @param {string} opts.resourceGroup - Name of resource group ex. backup.servicefabrik.io
+   * @param {string} opts.resourceType - Type of resource ex. defaultbackup
+   * @param {string} opts.resourceId - Unique id of resource ex. backup_guid
+   */
+  patchResource(opts) {
+    logger.info('Patching resource options with opts: ', opts);
+    assert.ok(opts.resourceGroup, `Property 'resourceGroup' is required to patch options`);
+    assert.ok(opts.resourceType, `Property 'resourceType' is required to patch options`);
+    assert.ok(opts.resourceId, `Property 'resourceId' is required to patch options`);
+    assert.ok(opts.metadata || opts.options || opts.status, `Property 'metadata' or 'options' or 'status' is required to patch resource`);
+    return this.getResource(opts)
+      .then(resource => {
+        if (_.get(opts, 'status.response') && resource.status) {
+          const oldResponse = _.get(resource, 'status.response');
+          const response = _.merge(oldResponse, opts.status.response);
+          _.set(opts.status, 'response', response);
+        }
+        if (opts.options && resource.spec) {
+          const oldOptions = _.get(resource, 'spec.options');
+          const options = _.merge(oldOptions, opts.options);
+          _.set(opts, 'options', options);
+        }
+        return this.updateResource(opts);
+      });
+  }
+
+  /**
+   * @description Delete Resource in Apiserver with the opts
+   * @param {string} opts.resourceGroup - Name of resource group ex. backup.servicefabrik.io
+   * @param {string} opts.resourceType - Type of resource ex. defaultbackup
+   * @param {string} opts.resourceId - Unique id of resource ex. backup_guid
+   */
+  deleteResource(opts) {
+    logger.info('Deleting resource with opts: ', opts);
+    assert.ok(opts.resourceGroup, `Property 'resourceGroup' is required to delete resource`);
+    assert.ok(opts.resourceType, `Property 'resourceType' is required to delete resource`);
+    assert.ok(opts.resourceId, `Property 'resourceId' is required to delete resource`);
     return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId)
-        .status.patch({
-          body: patchedResource
-        }))
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  /**
-   * @description Function to Update the error field
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.error - Value to set as error
-   */
-  updateOperationError(opts) {
-    const operationStatus = {
-      'status': {
-        'error': JSON.stringify(opts.error)
-      }
-    };
-    return this.patchResourceStatus(opts.operationName, opts.operationType, opts.operationId, operationStatus)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  /**
-   * @description Function to Update the state field
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.response - Object to be set as response
-   * @param {string} opts.stateValue - Value to set as state
-   */
-  updateOperationStateAndResponse(opts) {
-    logger.info('Updating Operation status with :', opts);
-    const patchedResource = {
-      'status': {
-        'state': opts.stateValue,
-        'response': JSON.stringify(opts.response)
-      }
-    };
-    return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId)
-        .status.patch({
-          body: patchedResource
-        }))
+      .then(() => apiserver.apis[opts.resourceGroup][CONST.APISERVER.API_VERSION]
+        .namespaces(CONST.APISERVER.NAMESPACE)[opts.resourceType](opts.resourceId).delete())
       .catch(err => {
         return convertToHttpErrorAndThrow(err);
       });
@@ -445,24 +368,62 @@ class ApiServerClient {
 
   /**
    * @description Update Last Operation to opts.value for resource
-   * @param {string} opts.resourceId - Unique id of resource
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {Object} opts.value - Unique if of the last operation
+   * @param {string} opts.resourceGroup - Name of resource group ex. backup.servicefabrik.io
+   * @param {string} opts.resourceType - Type of resource ex. defaultbackup
+   * @param {string} opts.resourceId - Unique id of resource ex. backup_guid
+   * @param {string} opts.operationName - Name of operation which was last operation
+   * @param {string} opts.operationType - Type of operation which was last operation
+   * @param {Object} opts.value - Unique id of the last operation ex: backup_guid
    */
-  updateLastOperation(opts) {
-    logger.debug(`Updating last operation on ${opts.resourceId} with ${opts.value}`);
-    const patchedResource = {};
-    patchedResource.metadata = {};
-    patchedResource.metadata.labels = {};
-    patchedResource.metadata.labels[`last_${opts.operationName}_${opts.operationType}`] = opts.value;
+  updateLastOperationValue(opts) {
+    logger.info('Updating last operation with opts: ', opts);
+    assert.ok(opts.resourceGroup, `Property 'resourceGroup' is required to update lastOperation`);
+    assert.ok(opts.resourceType, `Property 'resourceType' is required to update lastOperation`);
+    assert.ok(opts.resourceId, `Property 'resourceId' is required to update lastOperation`);
+    assert.ok(opts.operationName, `Property 'operationName' is required to update lastOperation`);
+    assert.ok(opts.operationType, `Property 'operationType' is required to update lastOperation`);
+    assert.ok(opts.value, `Property 'value' is required to update lastOperation`);
+    const metadata = {};
+    metadata.labels = {};
+    metadata.labels[`last_${opts.operationName}_${opts.operationType}`] = opts.value;
+    const options = _.chain(opts)
+      .omit('value', 'operationName', 'operationType')
+      .set('metadata', metadata)
+      .value();
+    return this.updateResource(options);
+  }
+
+  /**
+   * @description Get Resource in Apiserver with the opts
+   * @param {string} opts.resourceGroup - Unique id of resource
+   * @param {string} opts.resourceType - Name of operation
+   * @param {string} opts.resourceId - Type of operation
+   */
+  getResource(opts) {
+    logger.debug('Get resource with opts: ', opts);
+    assert.ok(opts.resourceGroup, `Property 'resourceGroup' is required to get resource`);
+    assert.ok(opts.resourceType, `Property 'resourceType' is required to get resource`);
+    assert.ok(opts.resourceId, `Property 'resourceId' is required to get resource`);
     return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[CONST.APISERVER.RESOURCE_TYPES.DIRECTOR](opts.resourceId)
-        .patch({
-          body: patchedResource
-        }))
+      .then(() => apiserver.apis[opts.resourceGroup][CONST.APISERVER.API_VERSION]
+        .namespaces(CONST.APISERVER.NAMESPACE)[opts.resourceType](opts.resourceId).get())
+      .then(resource => {
+        _.forEach(resource.body.spec, (val, key) => {
+          try {
+            resource.body.spec[key] = JSON.parse(val);
+          } catch (err) {
+            resource.body.spec[key] = val;
+          }
+        });
+        _.forEach(resource.body.status, (val, key) => {
+          try {
+            resource.body.status[key] = JSON.parse(val);
+          } catch (err) {
+            resource.body.status[key] = val;
+          }
+        });
+        return resource.body;
+      })
       .catch(err => {
         return convertToHttpErrorAndThrow(err);
       });
@@ -471,165 +432,67 @@ class ApiServerClient {
   /**
    * @description Gets Last Operation
    * @param {string} opts.resourceId - Unique id of resource
+   * @param {string} opts.resourceGroup - Name of operation
+   * @param {string} opts.resourceType - Type of operation
    * @param {string} opts.operationName - Name of operation
    * @param {string} opts.operationType - Type of operation
+   */
+  getLastOperationValue(opts) {
+    assert.ok(opts.resourceGroup, `Property 'resourceGroup' is required to get lastOperation`);
+    assert.ok(opts.resourceType, `Property 'resourceType' is required to get lastOperation`);
+    assert.ok(opts.resourceId, `Property 'resourceId' is required to get lastOperation`);
+    assert.ok(opts.operationName, `Property 'operationName' is required to get lastOperation`);
+    assert.ok(opts.operationType, `Property 'operationType' is required to get lastOperation`);
+    let options = _.chain(opts)
+      .omit('operationName', 'operationType')
+      .value();
+    logger.debug(`Getting label:  last_${opts.operationName}_${opts.operationType}`);
+    return this.getResource(options)
+      .then(json => _.get(json.metadata, `labels.last_${opts.operationName}_${opts.operationType}`));
+  }
+
+  /**
+   * @description Get resource Options
+   * @param {string} opts.resourceGroup - Name of operation
+   * @param {string} opts.resourceType - Type of operation
+   * @param {string} opts.resourceId - Unique id of resource
+   */
+  getOptions(opts) {
+    return this.getResource(opts)
+      .then(resource => _.get(resource, 'spec.options'));
+  }
+
+  /**
+   * @description Get resource response
+   * @param {string} opts.resourceGroup - Name of operation
+   * @param {string} opts.resourceType - Type of operation
+   * @param {string} opts.resourceId - Unique id of resource
+   */
+  getResponse(opts) {
+    return this.getResource(opts)
+      .then(resource => _.get(resource, 'status.response'));
+  }
+
+  /**
+   * @description Get resource state
+   * @param {string} opts.resourceGroup - Name of operation
+   * @param {string} opts.resourceType - Type of operation
+   * @param {string} opts.resourceId - Unique id of resource
+   */
+  getResourceState(opts) {
+    return this.getResource(opts)
+      .then(resource => _.get(resource, 'status.state'));
+  }
+
+  /**
+   * @description Get resource last operation
+   * @param {string} opts.resourceGroup - Name of operation
+   * @param {string} opts.resourceType - Type of operation
+   * @param {string} opts.resourceId - Unique id of resource
    */
   getLastOperation(opts) {
-    return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${CONST.APISERVER.RESOURCE_GROUPS.DEPLOYMENT}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[CONST.APISERVER.RESOURCE_TYPES.DIRECTOR](opts.resourceId)
-        .get())
-      .then(json => json.body.metadata.labels[`last_${opts.operationName}_${opts.operationType}`])
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  /**
-   * @description Patch Operation Options
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.value
-   */
-  patchOperationOptions(opts) {
-    return this.getOperationOptions(opts)
-      .then(res => {
-        logger.info(`Patching ${JSON.stringify(res)} with ${JSON.stringify(opts.value)}`);
-        opts.value = _.merge(res, opts.value);
-        return this.updateOperationOptions(opts);
-      });
-  }
-
-  /**
-   * @description Update Operation Options
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.value
-   */
-  updateOperationOptions(opts) {
-    logger.info('Updating resource with options:', opts.value);
-    const change = {
-      spec: {
-        'options': JSON.stringify(opts.value)
-      },
-    };
-    return this.patchResource(opts.operationName, opts.operationType, opts.operationId, change)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-  /**
-   * @description Get Operation Options
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   */
-  getOperationOptions(opts) {
-    assert.ok(opts.operationName, `Property 'operationName' is required to get operation state`);
-    assert.ok(opts.operationType, `Property 'operationType' is required to get operation state`);
-    assert.ok(opts.operationId, `Property 'operationId' is required to get operation state`);
-    return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId)
-        .get())
-      .then(json => JSON.parse(json.body.spec.options))
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  /**
-   * @description Get Operation State
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   */
-  getOperationState(opts) {
-    assert.ok(opts.operationName, `Property 'operationName' is required to get operation state`);
-    assert.ok(opts.operationType, `Property 'operationType' is required to get operation state`);
-    assert.ok(opts.operationId, `Property 'operationId' is required to get operation state`);
-    return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId)
-        .get())
-      .then(json => json.body.status.state)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  /**
-   * @description Get Operation Response
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   */
-  getOperationResponse(opts) {
-    logger.debug('Getting operation response with', opts);
-    return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId)
-        .get())
-      .then(json => JSON.parse(json.body.status.response))
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  /**
-   * @description Get Operation Status
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   */
-  getOperationStatus(opts) {
-    logger.info('Getting Operation Status with :', opts);
-    return this.getResource(opts.operationName, opts.operationType, opts.operationId)
-      .then(json => json.body.status)
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
-  }
-
-  /**
-   * @description Function to Update the status field
-   * @param {string} opts.operationName - Name of operation
-   * @param {string} opts.operationType - Type of operation
-   * @param {string} opts.operationId - Unique id of operation
-   * @param {Object} opts.stateValue - Value to set as state
-   * @param {Object} opts.error - Value to set as error
-   * @param {Object} opts.response - Value to set as error
-   */
-  updateOperationStatus(opts) {
-    logger.info('Updating Operation Status with :', opts);
-    const patchedResource = {
-      'status': {}
-    };
-    if (opts.stateValue) {
-      patchedResource.status.state = opts.stateValue;
-    }
-    if (opts.error) {
-      patchedResource.status.error = JSON.stringify(opts.error);
-    }
-    if (opts.response) {
-      patchedResource.status.response = JSON.stringify(opts.response);
-    }
-    return Promise.try(() => this.init())
-      .then(() => apiserver
-        .apis[`${opts.operationName}.${CONST.APISERVER.HOSTNAME}`][CONST.APISERVER.API_VERSION]
-        .namespaces(CONST.APISERVER.NAMESPACE)[opts.operationType](opts.operationId)
-        .status.patch({
-          body: patchedResource
-        }))
-      .catch(err => {
-        return convertToHttpErrorAndThrow(err);
-      });
+    return this.getResource(opts)
+      .then(resource => _.get(resource, 'status.lastOperation'));
   }
 
 }

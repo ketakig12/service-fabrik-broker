@@ -63,7 +63,8 @@ class EventLogInterceptor {
       //This check is specifically for enpoints like last_operation, :operation(backup/restore),
       //For operations which can be determined at HTTP verb, below is checked in execute() method itself
     }
-    const serviceInstanceType = req.manager ? `${req.manager.name}.` : '';
+    const planId = _.get(req, 'body.plan_id') || _.get(req, 'query.plan_id');
+    const serviceInstanceType = planId ? `${require('./models/catalog').getPlan(planId).manager.name}.` : (req.manager ? `${req.manager.name}.` : '');
     const response = _.cloneDeep(resBody);
     utils.maskSensitiveInfo(response);
     const info = this.getEventInfo(serviceInstanceType,
@@ -167,6 +168,9 @@ class EventLogInterceptor {
         //the reason which caused the internal server error might get fixed by the cloud controller timeout time,
         //at which time CC will stop polling for status and will mark the operation as failed.
         //Hence keeping in-progress as default state if it is not conclusively success/failure state.
+        if (res.statusCode === 410 && eventConfig.event_name === 'delete_instance') {
+          return this.successState(eventConfig);
+        }
         return this.inProgressState(eventConfig);
       }
     } else if (_.includes(eventConfig.http_success_codes, res.statusCode)) {

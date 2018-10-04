@@ -14,6 +14,9 @@ const HttpClient = utils.HttpClient;
 const config = require('../../common/config');
 const NotFound = errors.NotFound;
 const BadRequest = errors.BadRequest;
+const UaaClient = require('../cf/UaaClient');
+const TokenIssuer = require('../cf/TokenIssuer');
+const HttpServer = require('../../common/HttpServer');
 
 class BoshDirectorClient extends HttpClient {
   constructor() {
@@ -33,7 +36,55 @@ class BoshDirectorClient extends HttpClient {
     this.deploymentIpsCache = {};
     this.cacheLoadInProgressForDeployment = {};
     this.cacheLoadInProgress = false;
+    this.uaaObjects = {};
+    //populate UAA objects if uaa based auth is being used by any of the directors
+    this.determineDirectorAuthenticationMethod();
     this.ready = this.populateConfigCache();
+  }
+
+  determineDirectorAuthenticationMethod() {
+    _.forEach(config.directors, directorConfig => {
+      if (_.get(directorConfig, 'uaa.uaa_auth', undefined) === true) {
+        let directorName = _.get(directorConfig, 'name', undefined);
+        logger.info(`Director ${directorName} uses UAA based authentication. Populating UAA objects in directorConfig.`);
+        this.populateUAAObjects(directorConfig);
+        if (_.get(this.uaaObjects, `${directorName}.uaaClient`, undefined) instanceof UaaClient &&
+          _.get(this.uaaObjects, `${directorName}.tokenIssuer`, undefined) instanceof TokenIssuer) {
+          logger.info(`UAA based authentication enabled successfully for ${directorName}.`);
+          _.set(directorConfig, 'uaaEnabled', true);
+        } else {
+          //Fatal error condition. Logging and exiting.
+          logger.error(`UAA objects were not populated successfully for bosh ${directorName}. Exiting.`);
+          HttpServer.immediateShutdown();
+        }
+      } else {
+        logger.info(`Director ${directorConfig.name} uses basic authentication.`);
+      }
+    });
+  }
+
+  populateUAAObjects(directorConfig) {
+    /* Client id and client secret will be used when requesting the token. Here just a sanity check.*/
+    let uaaClientId = _.get(directorConfig, 'uaa.client_id', undefined);
+    let uaaClientSecret = _.get(directorConfig, 'uaa.client_secret', undefined);
+    if (!uaaClientId || !uaaClientSecret) {
+      logger.error(`UAA credentials for director ${directorConfig.name} not provided. Error condition.`);
+      return;
+    }
+    /* create uaaClient and tokenIssuer for this director */
+    let uaaUrl = _.get(directorConfig, 'uaa.uaa_url', undefined);
+    if (!uaaUrl) {
+      logger.error(`UAA url not provided to populateUAAObjects.`);
+      return;
+    }
+
+    let directorName = _.get(directorConfig, 'name', undefined);
+    this.uaaObjects[directorName] = {};
+    this.uaaObjects[directorName].uaaClient = new UaaClient({}, uaaUrl);
+    this.uaaObjects[directorName].tokenIssuer = new TokenIssuer(this.uaaObjects[directorName].uaaClient);
+    this.uaaObjects[directorName].clientId = uaaClientId;
+    this.uaaObjects[directorName].clientSecret = uaaClientSecret;
+
   }
 
   clearConfigCache(config) {
@@ -196,12 +247,26 @@ class BoshDirectorClient extends HttpClient {
 
   makeRequestWithConfig(requestDetails, expectedStatusCode, directorConfig) {
     requestDetails.baseUrl = directorConfig.url;
-    requestDetails.auth = {
-      user: directorConfig.username,
-      pass: directorConfig.password
-    };
     requestDetails.rejectUnauthorized = !directorConfig.skip_ssl_validation;
-    return this.request(requestDetails, expectedStatusCode);
+    if (directorConfig.uaaEnabled) {
+      let directorName = _.get(directorConfig, 'name', undefined);
+      let clientId = this.uaaObjects[directorName].clientId;
+      let clientSecret = this.uaaObjects[directorName].clientSecret;
+      let tokenIssuer = this.uaaObjects[directorName].tokenIssuer;
+      return Promise.try(() => tokenIssuer.getAccessTokenBoshUAA(clientId, clientSecret))
+        .then(accessToken => {
+          requestDetails.auth = {
+            bearer: accessToken
+          };
+          return this.request(requestDetails, expectedStatusCode);
+        });
+    } else {
+      requestDetails.auth = {
+        user: directorConfig.username,
+        pass: directorConfig.password
+      };
+      return this.request(requestDetails, expectedStatusCode);
+    }
   }
 
   getInfo() {
@@ -287,26 +352,6 @@ class BoshDirectorClient extends HttpClient {
         .uniq()
         .value()
       );
-  }
-
-  getLockProperty(deploymentName) {
-    return this
-      .getDeploymentProperty(deploymentName, CONST.DEPLOYMENT_LOCK_NAME)
-      .then(result => {
-        const lockInfo = JSON.parse(result);
-        logger.debug('LockInfo :-', lockInfo);
-        if (lockInfo.createdAt) {
-          lockInfo.createdAt = new Date(lockInfo.createdAt);
-          //Above check unnecessary, but for whatsoever reason if the lock is corrupted, we dont return back lockinfo
-          const lockDuration = (new Date() - lockInfo.createdAt) / 1000;
-          logger.info(`Lock duration is : ${lockDuration} (secs) -- ${this.activePrimary[0].lock_deployment_max_duration}`);
-          if (lockDuration < this.activePrimary[0].lock_deployment_max_duration) {
-            return Promise.resolve(lockInfo);
-          }
-        }
-        return undefined;
-      })
-      .catch(NotFound, () => undefined);
   }
 
   getDeployment(deploymentName) {
@@ -769,6 +814,37 @@ class BoshDirectorClient extends HttpClient {
         .map(JSON.parse)
         .value()
       );
+  }
+
+  startDeployment(deploymentName) {
+    return this
+      .getDirectorConfig(deploymentName)
+      .then(config => this.invokeDeploymentJobAction(config, deploymentName, CONST.BOSH_DEPLOYMENT_ACTIONS.STARTED));
+  }
+
+  stopDeployment(deploymentName) {
+    return this
+      .getDirectorConfig(deploymentName)
+      .then(config => this.invokeDeploymentJobAction(config, deploymentName, CONST.BOSH_DEPLOYMENT_ACTIONS.STOPPED));
+  }
+
+  invokeDeploymentJobAction(directorConfig, deploymentName, expectedState) {
+    return this
+      .makeRequestWithConfig({
+        method: 'PUT',
+        url: `/deployments/${deploymentName}/jobs/*`,
+        headers: {
+          'content-type': 'text/yaml'
+        },
+        qs: {
+          'state': expectedState
+        }
+      }, 302, directorConfig)
+      .then(res => {
+        const taskId = this.lastSegment(res.headers.location);
+        logger.info(`Sent signal to ${deploymentName} for result state ${expectedState}, BOSH task ID: ${taskId}`);
+        return taskId;
+      });
   }
 
   getTaskEvents(taskId) {

@@ -14,10 +14,6 @@ class VirtualHostInstance extends BaseInstance {
     this.mapper = mapper.VirtualHostRelationMapper;
   }
 
-  get async() {
-    return false;
-  }
-
   initialize() {
     /** Here optimization ca be made by checking if this.deploymentName is present
      *  then only make call getDeploymentNameForInstanceId*/
@@ -30,32 +26,6 @@ class VirtualHostInstance extends BaseInstance {
       platform: CONST.PLATFORM.CF
     };
     return context;
-  }
-
-  create(params) {
-    return this.cloudController.getServiceInstanceByName(params.parameters.dedicated_rabbitmq_instance, params.space_guid)
-      .then(serviceInstance => this.director.getDeploymentNameForInstanceId(serviceInstance.metadata.guid))
-      .then(deploymentName => this.manager.createVirtualHost(deploymentName, params, this.guid));
-  }
-
-  delete(params) {
-    return this.initialize()
-      .then(() => this.manager.deleteVirtualHost(this.deploymentName, this.guid, params));
-  }
-
-  bind(params) {
-    return this
-      .initialize()
-      .then(() => this.manager.createBinding(this.deploymentName, this.guid, {
-        id: params.binding_id,
-        parameters: params.parameters || {}
-      }));
-  }
-
-  unbind(params) {
-    return this
-      .initialize()
-      .then(() => this.manager.deleteBinding(this.deploymentName, this.guid, params.binding_id));
   }
 
   getInfo() {
